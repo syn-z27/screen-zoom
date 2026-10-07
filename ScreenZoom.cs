@@ -3,6 +3,7 @@
 // .NET Framework 4.x 付属の csc.exe (C# 5) でビルドできるよう、新しい言語機能は使わない。
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
@@ -53,8 +54,9 @@ sealed class ZoomContext : ApplicationContext
     readonly System.Windows.Forms.Timer sourceTimer;
     // 透明ウィンドウに届いたが、入力元 (マウスかタッチパッドか) が未確定のスクロール
     readonly List<WheelEvent> pendingWheels = new List<WheelEvent>();
-    // Raw Input で届いた、マウス本体のホイール操作 (透明ウィンドウ側のスクロールと突き合わせる)
-    readonly List<WheelEvent> rawMouseWheels = new List<WheelEvent>();
+    readonly Stopwatch clock = Stopwatch.StartNew();
+    long lastRawWheelMs = long.MinValue / 2; // Raw Input でマウス本体のホイール操作が届いた時刻
+    int lastRawWheelSign;
     readonly NotifyIcon tray;
     readonly ToolStripMenuItem enabledItem;
     readonly ToolStripMenuItem startupItem;
@@ -208,15 +210,16 @@ sealed class ZoomContext : ApplicationContext
 
     // マウスとタッチパッドのスクロールは、マウスフックでも透明ウィンドウでも同じ形で届き区別できない。
     // マウス本体のホイール操作だけが Raw Input に入力元の機器付きで届くため、
-    // 同じスクロール量の Raw Input が前後 SourceWaitMs 以内にあればマウス、なければタッチパッドとみなす。
-    const int SourceWaitMs = 40;
-    const int RawKeepMs = 200;
+    // 同じ向きの Raw Input が近い時刻にあればマウス、なければタッチパッドとみなす。
+    // ホイールを速く回すと透明ウィンドウ側では複数ノッチがまとめて届くため、スクロール量は突き合わせない。
+    const int SourceWaitMs = 40;  // Raw Input を待つ時間。過ぎたらタッチパッドとみなす
+    const int RawRecentMs = 150;  // Raw Input が先に届いていた場合に、マウスとみなす時間
 
     sealed class WheelEvent
     {
         public int Delta;
         public Point Cursor;
-        public int Tick;
+        public long ReceivedMs;
     }
 
     void RegisterRawMouseInput()
@@ -235,14 +238,15 @@ sealed class ZoomContext : ApplicationContext
     void OnOverlayWheel(int delta, Point cursor)
     {
         zoomedDuringWin = true; // 判定待ちの間に Win キーが離されてもスタートメニューを抑止する
-        WheelEvent raw = TakeMatching(rawMouseWheels, delta);
-        DebugLog.Write(string.Format("wheel path=overlay delta={0} source={1}", delta, raw != null ? "mouse" : "pending"));
-        if (raw != null)
+        long now = clock.ElapsedMilliseconds;
+        bool mouse = now - lastRawWheelMs <= RawRecentMs && Math.Sign(delta) == lastRawWheelSign;
+        DebugLog.Write(string.Format("wheel path=overlay delta={0} source={1}", delta, mouse ? "mouse" : "pending"));
+        if (mouse)
         {
             OnZoomWheel(delta, cursor);
             return;
         }
-        pendingWheels.Add(new WheelEvent { Delta = delta, Cursor = cursor, Tick = Environment.TickCount });
+        pendingWheels.Add(new WheelEvent { Delta = delta, Cursor = cursor, ReceivedMs = now });
         sourceTimer.Start();
     }
 
@@ -269,16 +273,16 @@ sealed class ZoomContext : ApplicationContext
             DebugLog.Write(string.Format("raw wheel delta={0} device=0x{1:X}", delta, header.hDevice.ToInt64()));
             if (header.hDevice == IntPtr.Zero) return; // 機器を特定できない入力 (タッチパッド由来の可能性) は扱わない
 
-            WheelEvent pending = TakeMatching(pendingWheels, delta);
-            if (pending != null)
+            lastRawWheelMs = clock.ElapsedMilliseconds;
+            lastRawWheelSign = Math.Sign(delta);
+
+            // 先に届いて判定待ちになっている同じ向きのスクロールは、マウスのものとして処理する
+            foreach (WheelEvent pending in pendingWheels.FindAll(e => Math.Sign(e.Delta) == lastRawWheelSign))
             {
                 OnZoomWheel(pending.Delta, pending.Cursor);
             }
-            else
-            {
-                rawMouseWheels.Add(new WheelEvent { Delta = delta, Tick = Environment.TickCount });
-                sourceTimer.Start();
-            }
+            pendingWheels.RemoveAll(e => Math.Sign(e.Delta) == lastRawWheelSign);
+            if (pendingWheels.Count == 0) sourceTimer.Stop();
         }
         finally
         {
@@ -289,8 +293,8 @@ sealed class ZoomContext : ApplicationContext
     // 判定待ちのまま SourceWaitMs 経ったスクロールはタッチパッドとして扱う
     void ResolveWheelSources()
     {
-        int now = Environment.TickCount;
-        while (pendingWheels.Count > 0 && now - pendingWheels[0].Tick >= SourceWaitMs)
+        long now = clock.ElapsedMilliseconds;
+        while (pendingWheels.Count > 0 && now - pendingWheels[0].ReceivedMs >= SourceWaitMs)
         {
             WheelEvent e = pendingWheels[0];
             pendingWheels.RemoveAt(0);
@@ -298,19 +302,7 @@ sealed class ZoomContext : ApplicationContext
             // タッチパッドは指の動きとズーム方向を合わせるため、向きを逆にする
             OnZoomWheel(-e.Delta, e.Cursor);
         }
-        rawMouseWheels.RemoveAll(e => now - e.Tick > RawKeepMs);
-        if (pendingWheels.Count == 0 && rawMouseWheels.Count == 0) sourceTimer.Stop();
-    }
-
-    static WheelEvent TakeMatching(List<WheelEvent> list, int delta)
-    {
-        int now = Environment.TickCount;
-        list.RemoveAll(e => now - e.Tick > RawKeepMs);
-        int index = list.FindIndex(e => e.Delta == delta);
-        if (index < 0) return null;
-        WheelEvent found = list[index];
-        list.RemoveAt(index);
-        return found;
+        if (pendingWheels.Count == 0) sourceTimer.Stop();
     }
 
     void OnZoomWheel(int delta, Point cursor)
