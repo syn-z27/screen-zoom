@@ -125,8 +125,6 @@ sealed class ZoomContext : ApplicationContext
 
                 if (msg == Native.WM_MOUSEWHEEL)
                 {
-                    DebugLog.Write(string.Format("wheel path=hook delta={0} flags=0x{1:X} extra=0x{2:X} win={3}",
-                        (short)((info.mouseData >> 16) & 0xFFFF), info.flags, info.dwExtraInfo.ToInt64(), IsWinKeyDown()));
                     if (enabled && IsWinKeyDown())
                     {
                         // 透明ウィンドウが出ていれば、そちらで入力元を判定してズームする。
@@ -158,9 +156,6 @@ sealed class ZoomContext : ApplicationContext
             {
                 int msg = wParam.ToInt32();
                 bool own = info.dwExtraInfo == Native.OwnInputSignature;
-                DebugLog.Write(string.Format("key vk=0x{0:X} msg=0x{1:X} flags=0x{2:X} own={3} zoomed={4}",
-                    info.vkCode, msg, info.flags, own, zoomedDuringWin));
-
                 if (msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN)
                 {
                     if (!winDown)
@@ -231,7 +226,8 @@ sealed class ZoomContext : ApplicationContext
         device.hwndTarget = overlay.Handle;
         if (!Native.RegisterRawInputDevices(new[] { device }, 1, (uint)Marshal.SizeOf(typeof(Native.RAWINPUTDEVICE))))
         {
-            DebugLog.Write("RegisterRawInputDevices failed: " + Marshal.GetLastWin32Error());
+            MessageBox.Show("Raw Input の登録に失敗しました。マウスホイールのズーム方向が逆になる場合があります。",
+                "ScreenZoom", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 
@@ -240,7 +236,6 @@ sealed class ZoomContext : ApplicationContext
         zoomedDuringWin = true; // 判定待ちの間に Win キーが離されてもスタートメニューを抑止する
         long now = clock.ElapsedMilliseconds;
         bool mouse = now - lastRawWheelMs <= RawRecentMs && Math.Sign(delta) == lastRawWheelSign;
-        DebugLog.Write(string.Format("wheel path=overlay delta={0} source={1}", delta, mouse ? "mouse" : "pending"));
         if (mouse)
         {
             OnZoomWheel(delta, cursor);
@@ -270,7 +265,6 @@ sealed class ZoomContext : ApplicationContext
             if ((buttonFlags & Native.RI_MOUSE_WHEEL) == 0) return;
             int delta = Marshal.ReadInt16(mouse, 6);
 
-            DebugLog.Write(string.Format("raw wheel delta={0} device=0x{1:X}", delta, header.hDevice.ToInt64()));
             if (header.hDevice == IntPtr.Zero) return; // 機器を特定できない入力 (タッチパッド由来の可能性) は扱わない
 
             lastRawWheelMs = clock.ElapsedMilliseconds;
@@ -298,7 +292,6 @@ sealed class ZoomContext : ApplicationContext
         {
             WheelEvent e = pendingWheels[0];
             pendingWheels.RemoveAt(0);
-            DebugLog.Write(string.Format("wheel resolved delta={0} source=touchpad", e.Delta));
             // タッチパッドは指の動きとズーム方向を合わせるため、向きを逆にする
             OnZoomWheel(-e.Delta, e.Cursor);
         }
@@ -430,22 +423,6 @@ sealed class ZoomContext : ApplicationContext
     {
         Cleanup();
         base.ExitThreadCore();
-    }
-}
-
-// 調査用: マウスホイールとタッチパッドのスクロールの違いを %TEMP%\ScreenZoom.log に記録する
-static class DebugLog
-{
-    static readonly string LogPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "ScreenZoom.log");
-
-    public static void Write(string line)
-    {
-        try
-        {
-            System.IO.File.AppendAllText(LogPath,
-                DateTime.Now.ToString("HH:mm:ss.fff") + " " + line + Environment.NewLine);
-        }
-        catch (System.IO.IOException) { }
     }
 }
 
