@@ -52,14 +52,26 @@ sealed class ZoomContext : ApplicationContext
     const string LegacyRunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     const string LegacyRunValue = "ScreenZoom";
 
+    // 低レベルフックは応答が遅れると Windows に黙って外される (以降の入力が届かなくなる)。
+    // そのためフック内では状態の更新だけを行い、画面やウィンドウの更新は BeginInvoke で後回しにする。
+    // それでも外れた場合に備え、hookWatch で外れたことを検知して登録し直す。
+    const int HookWatchMs = 250;
+
     // GC 回収防止のためフックのデリゲートはフィールドで保持
     readonly Native.LowLevelHookProc hookProc;
-    readonly IntPtr hookHandle;
+    IntPtr hookHandle;
     readonly Native.LowLevelHookProc keyHookProc;
-    readonly IntPtr keyHookHandle;
+    IntPtr keyHookHandle;
     readonly OverlayForm overlay;
     readonly System.Windows.Forms.Timer overlayWatch;
     readonly System.Windows.Forms.Timer sourceTimer;
+    readonly System.Windows.Forms.Timer hookWatch;
+    bool transformPending;    // 画面の拡大の更新を予約済みか
+    bool overlayWanted;       // Ctrl+Shift が押されていて透明ウィンドウを出すべきか
+    bool overlayUpdatePending;
+    Point lastHookCursor;     // マウスフックが最後に受け取ったカーソル位置
+    long lastMouseHookMs;
+    long modifierWithoutOverlayMs = -1; // Ctrl+Shift が押されているのに透明ウィンドウが出ていない状態になった時刻
     // 透明ウィンドウに届いたが、入力元 (マウスかタッチパッドか) が未確定のスクロール
     readonly List<WheelEvent> pendingWheels = new List<WheelEvent>();
     readonly Stopwatch clock = Stopwatch.StartNew();
@@ -78,16 +90,7 @@ sealed class ZoomContext : ApplicationContext
     public ZoomContext()
     {
         hookProc = HookCallback;
-        hookHandle = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, hookProc,
-            Native.GetModuleHandle(null), 0);
         keyHookProc = KeyHookCallback;
-        keyHookHandle = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, keyHookProc,
-            Native.GetModuleHandle(null), 0);
-        if (hookHandle == IntPtr.Zero || keyHookHandle == IntPtr.Zero)
-        {
-            MessageBox.Show("マウス/キーボードフックの登録に失敗しました。", "ScreenZoom",
-                MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
 
         overlay = new OverlayForm(OnOverlayWheel, OnRawInput);
         RegisterRawMouseInput();
@@ -97,13 +100,17 @@ sealed class ZoomContext : ApplicationContext
         // Win+L 等でキーを離したことを取りこぼしても透明ウィンドウが残り続けないよう定期確認する
         overlayWatch = new System.Windows.Forms.Timer();
         overlayWatch.Interval = 200;
-        overlayWatch.Tick += delegate { if (!IsModifierDown()) HideOverlay(); };
+        overlayWatch.Tick += delegate
+        {
+            if (IsModifierDown()) return;
+            overlayWanted = false;
+            HideOverlay();
+        };
 
-        MigrateLegacyStartup();
         enabledItem = new ToolStripMenuItem("有効", null, delegate { ToggleEnabled(); });
         enabledItem.Checked = true;
         startupItem = new ToolStripMenuItem("Windows 起動時に実行", null, delegate { ToggleStartup(); });
-        startupItem.Checked = IsStartupRegistered();
+        startupItem.Enabled = false; // 登録状況を確認し終えるまで操作させない
 
         var menu = new ContextMenuStrip();
         menu.Items.Add(enabledItem);
@@ -121,6 +128,72 @@ sealed class ZoomContext : ApplicationContext
 
         // ログオフ・シャットダウン時にもズームを戻す
         SystemEvents.SessionEnding += delegate { Cleanup(); };
+
+        // schtasks の実行は時間がかかるため、フックの応答を妨げないよう別スレッドで行う
+        RunStartupTaskInBackground(delegate { MigrateLegacyStartup(); });
+
+        // 時間のかかる準備がすべて終わってからフックを登録する
+        InstallHooks();
+        hookWatch = new System.Windows.Forms.Timer();
+        hookWatch.Interval = HookWatchMs;
+        hookWatch.Tick += delegate { CheckHooksAlive(); };
+        hookWatch.Start();
+    }
+
+    void InstallHooks()
+    {
+        if (hookHandle != IntPtr.Zero) Native.UnhookWindowsHookEx(hookHandle);
+        if (keyHookHandle != IntPtr.Zero) Native.UnhookWindowsHookEx(keyHookHandle);
+        hookHandle = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, hookProc, Native.GetModuleHandle(null), 0);
+        keyHookHandle = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, keyHookProc, Native.GetModuleHandle(null), 0);
+        lastHookCursor = Cursor.Position;
+        lastMouseHookMs = clock.ElapsedMilliseconds;
+        modifierWithoutOverlayMs = -1;
+        if (hookHandle == IntPtr.Zero || keyHookHandle == IntPtr.Zero)
+        {
+            MessageBox.Show("マウス/キーボードフックの登録に失敗しました。", "ScreenZoom",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    // フックが外れたことは通知されないため、実際の入力状態とフックが受け取った内容の食い違いで判断する
+    void CheckHooksAlive()
+    {
+        long now = clock.ElapsedMilliseconds;
+
+        // キーボードフック: Ctrl+Shift が押されたままなのに透明ウィンドウを出す指示が来ていない
+        bool keyboardDead = false;
+        if (enabled && IsModifierDown() && !overlayWanted)
+        {
+            if (modifierWithoutOverlayMs < 0) modifierWithoutOverlayMs = now;
+            else if (now - modifierWithoutOverlayMs >= HookWatchMs) keyboardDead = true;
+        }
+        else
+        {
+            modifierWithoutOverlayMs = -1;
+        }
+
+        // マウスフック: カーソルが動いているのにマウスフックが何も受け取っていない
+        Point cursor = Cursor.Position;
+        bool mouseDead = cursor != lastHookCursor && now - lastMouseHookMs >= HookWatchMs * 2;
+
+        if (keyboardDead || mouseDead) InstallHooks();
+    }
+
+    // 処理を別スレッドで実行し、終わったら自動起動の登録状況をメニューに反映する
+    void RunStartupTaskInBackground(Action work)
+    {
+        startupItem.Enabled = false;
+        ThreadPool.QueueUserWorkItem(delegate
+        {
+            work();
+            bool registered = IsStartupRegistered();
+            overlay.BeginInvoke((Action)delegate
+            {
+                startupItem.Checked = registered;
+                startupItem.Enabled = true;
+            });
+        });
     }
 
     IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -128,10 +201,12 @@ sealed class ZoomContext : ApplicationContext
         if (nCode >= 0)
         {
             int msg = wParam.ToInt32();
-            if (msg == Native.WM_MOUSEWHEEL || (msg == Native.WM_MOUSEMOVE && level > 1f))
+            if (msg == Native.WM_MOUSEWHEEL || msg == Native.WM_MOUSEMOVE)
             {
                 var info = (Native.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.MSLLHOOKSTRUCT));
                 var pt = new Point(info.pt.x, info.pt.y);
+                lastHookCursor = pt;
+                lastMouseHookMs = clock.ElapsedMilliseconds;
 
                 if (msg == Native.WM_MOUSEWHEEL)
                 {
@@ -145,7 +220,7 @@ sealed class ZoomContext : ApplicationContext
                         return new IntPtr(1); // ホイール入力自体はアプリに渡さない
                     }
                 }
-                else
+                else if (level > 1f)
                 {
                     FollowCursor(pt);
                 }
@@ -171,17 +246,24 @@ sealed class ZoomContext : ApplicationContext
                 // フック内ではこのキーの状態がまだ反映されていないため、このキーだけはイベントから判断する
                 bool ctrl = isCtrl ? pressed : IsKeyDown(Native.VK_CONTROL);
                 bool shift = isShift ? pressed : IsKeyDown(Native.VK_SHIFT);
-                if (ctrl && shift)
-                {
-                    if (enabled) ShowOverlay();
-                }
-                else
-                {
-                    HideOverlay();
-                }
+                overlayWanted = ctrl && shift;
+                RequestOverlayUpdate();
             }
         }
         return Native.CallNextHookEx(keyHookHandle, nCode, wParam, lParam);
+    }
+
+    // 透明ウィンドウの表示切り替えはフックの外で行う
+    void RequestOverlayUpdate()
+    {
+        if (overlayUpdatePending) return;
+        overlayUpdatePending = true;
+        overlay.BeginInvoke((Action)delegate
+        {
+            overlayUpdatePending = false;
+            if (overlayWanted && enabled) ShowOverlay();
+            else HideOverlay();
+        });
     }
 
     void ShowOverlay()
@@ -322,8 +404,8 @@ sealed class ZoomContext : ApplicationContext
         viewX = cursor.X - (cursor.X - viewX) * level / newLevel;
         viewY = cursor.Y - (cursor.Y - viewY) * level / newLevel;
         level = newLevel;
-        ApplyTransform();
-        UpdateTooltip();
+        ClampView();
+        RequestTransform();
     }
 
     // カーソルが拡大表示している領域の端を越えたときだけ、越えた分だけ領域を動かす
@@ -343,21 +425,34 @@ sealed class ZoomContext : ApplicationContext
         if (x == viewX && y == viewY) return;
         viewX = x;
         viewY = y;
-        ApplyTransform();
+        ClampView();
+        RequestTransform();
+    }
+
+    void ClampView()
+    {
+        Rectangle screen = VirtualScreen();
+        viewX = Clamp(viewX, screen.Left, screen.Right - screen.Width / level);
+        viewY = Clamp(viewY, screen.Top, screen.Bottom - screen.Height / level);
+    }
+
+    // 画面の拡大の更新はフックの外で行う。予約中に届いた変更はまとめて最新の状態だけを反映する
+    void RequestTransform()
+    {
+        if (transformPending) return;
+        transformPending = true;
+        overlay.BeginInvoke((Action)delegate
+        {
+            transformPending = false;
+            ApplyTransform();
+            UpdateTooltip();
+        });
     }
 
     void ApplyTransform()
     {
-        if (level <= 1f)
-        {
-            Native.MagSetFullscreenTransform(1f, 0, 0);
-            return;
-        }
-
-        Rectangle screen = VirtualScreen();
-        viewX = Clamp(viewX, screen.Left, screen.Right - screen.Width / level);
-        viewY = Clamp(viewY, screen.Top, screen.Bottom - screen.Height / level);
-        Native.MagSetFullscreenTransform(level, (int)Math.Round(viewX), (int)Math.Round(viewY));
+        if (level <= 1f) Native.MagSetFullscreenTransform(1f, 0, 0);
+        else Native.MagSetFullscreenTransform(level, (int)Math.Round(viewX), (int)Math.Round(viewY));
     }
 
     static Rectangle VirtualScreen()
@@ -400,9 +495,12 @@ sealed class ZoomContext : ApplicationContext
 
     void ToggleStartup()
     {
-        if (IsStartupRegistered()) RunSchtasks("/Delete /TN \"" + TaskName + "\" /F");
-        else RegisterStartupTask();
-        startupItem.Checked = IsStartupRegistered();
+        bool register = !startupItem.Checked;
+        RunStartupTaskInBackground(delegate
+        {
+            if (register) RegisterStartupTask();
+            else RunSchtasks("/Delete /TN \"" + TaskName + "\" /F");
+        });
     }
 
     // 以前の版が Run キーに登録した自動起動は管理者権限では機能しないため、タスクスケジューラへ移す
@@ -493,6 +591,7 @@ sealed class ZoomContext : ApplicationContext
     {
         if (cleanedUp) return;
         cleanedUp = true;
+        hookWatch.Stop();
         if (hookHandle != IntPtr.Zero) Native.UnhookWindowsHookEx(hookHandle);
         if (keyHookHandle != IntPtr.Zero) Native.UnhookWindowsHookEx(keyHookHandle);
         overlayWatch.Stop();
