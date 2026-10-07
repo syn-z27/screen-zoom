@@ -1,12 +1,17 @@
 // ScreenZoom: macOS のアクセシビリティズームを Windows で再現する常駐ツール。
-// Win キーを押しながらホイールを回すと画面全体を拡大/縮小し、拡大中はカーソルに追従する。
+// Ctrl+Shift を押しながらホイールを回すと画面全体を拡大/縮小し、拡大中はカーソルに追従する。
+// 管理者権限のウィンドウ (タスクマネージャー等) 上でも入力を捕捉できるよう、管理者権限で動かす (ScreenZoom.manifest)。
 // .NET Framework 4.x 付属の csc.exe (C# 5) でビルドできるよう、新しい言語機能は使わない。
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Security;
+using System.Security.Principal;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -41,8 +46,11 @@ sealed class ZoomContext : ApplicationContext
 {
     const float MaxLevel = 20f;
     const double StepPerNotch = 1.12; // ホイール 1 ノッチ (delta=120) あたりの倍率
-    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
-    const string RunValue = "ScreenZoom";
+    // 管理者権限の exe は Run キーからは起動されないため、自動起動はタスクスケジューラに登録する。
+    // Run キーは以前の版の登録を移行するためだけに参照する。
+    const string TaskName = "ScreenZoom";
+    const string LegacyRunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    const string LegacyRunValue = "ScreenZoom";
 
     // GC 回収防止のためフックのデリゲートはフィールドで保持
     readonly Native.LowLevelHookProc hookProc;
@@ -63,8 +71,9 @@ sealed class ZoomContext : ApplicationContext
 
     float level = 1f;
     bool enabled = true;
-    bool winDown;
-    bool zoomedDuringWin; // 今回の Win キー押下中にズームしたか
+    // 拡大表示している領域の左上 (等倍時の画面座標)。カーソルが領域の端を越えたときだけ動かす
+    double viewX;
+    double viewY;
 
     public ZoomContext()
     {
@@ -88,8 +97,9 @@ sealed class ZoomContext : ApplicationContext
         // Win+L 等でキーを離したことを取りこぼしても透明ウィンドウが残り続けないよう定期確認する
         overlayWatch = new System.Windows.Forms.Timer();
         overlayWatch.Interval = 200;
-        overlayWatch.Tick += delegate { if (!IsWinKeyDown()) HideOverlay(); };
+        overlayWatch.Tick += delegate { if (!IsModifierDown()) HideOverlay(); };
 
+        MigrateLegacyStartup();
         enabledItem = new ToolStripMenuItem("有効", null, delegate { ToggleEnabled(); });
         enabledItem.Checked = true;
         startupItem = new ToolStripMenuItem("Windows 起動時に実行", null, delegate { ToggleStartup(); });
@@ -125,7 +135,7 @@ sealed class ZoomContext : ApplicationContext
 
                 if (msg == Native.WM_MOUSEWHEEL)
                 {
-                    if (enabled && IsWinKeyDown())
+                    if (enabled && IsModifierDown())
                     {
                         // 透明ウィンドウが出ていれば、そちらで入力元を判定してズームする。
                         // ここで止めると Raw Input も届かなくなるため、通過させる。
@@ -137,7 +147,7 @@ sealed class ZoomContext : ApplicationContext
                 }
                 else
                 {
-                    ApplyTransform(pt);
+                    FollowCursor(pt);
                 }
             }
         }
@@ -145,49 +155,33 @@ sealed class ZoomContext : ApplicationContext
     }
 
     // 高精度タッチパッドの二本指スクロールは Chrome やエクスプローラー等へ直接届き、
-    // マウスフックでは捕捉できない。Win キーを押している間だけ透明ウィンドウを最前面に置き、
+    // マウスフックでは捕捉できない。Ctrl+Shift を押している間だけ透明ウィンドウを最前面に置き、
     // スクロールをそのウィンドウで受け取ることでアプリへ届かないようにする。
     IntPtr KeyHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
         if (nCode >= 0)
         {
             var info = (Native.KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.KBDLLHOOKSTRUCT));
-            if (info.vkCode == Native.VK_LWIN || info.vkCode == Native.VK_RWIN)
+            bool isCtrl = info.vkCode == Native.VK_LCONTROL || info.vkCode == Native.VK_RCONTROL;
+            bool isShift = info.vkCode == Native.VK_LSHIFT || info.vkCode == Native.VK_RSHIFT;
+            if (isCtrl || isShift)
             {
                 int msg = wParam.ToInt32();
-                bool own = info.dwExtraInfo == Native.OwnInputSignature;
-                if (msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN)
+                bool pressed = msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN;
+                // フック内ではこのキーの状態がまだ反映されていないため、このキーだけはイベントから判断する
+                bool ctrl = isCtrl ? pressed : IsKeyDown(Native.VK_CONTROL);
+                bool shift = isShift ? pressed : IsKeyDown(Native.VK_SHIFT);
+                if (ctrl && shift)
                 {
-                    if (!winDown)
-                    {
-                        winDown = true;
-                        zoomedDuringWin = false;
-                    }
                     if (enabled) ShowOverlay();
                 }
-                else if (msg == Native.WM_KEYUP || msg == Native.WM_SYSKEYUP)
+                else
                 {
-                    winDown = false;
                     HideOverlay();
-                    if (!own && zoomedDuringWin)
-                    {
-                        zoomedDuringWin = false;
-                        ReleaseWinWithoutStartMenu((byte)info.vkCode);
-                        return new IntPtr(1); // 本来の解放は止め、ダミーキーを挟んだ解放を送り直す
-                    }
                 }
             }
         }
         return Native.CallNextHookEx(keyHookHandle, nCode, wParam, lParam);
-    }
-
-    // Win キー単独の押下・解放とみなされるとスタートメニューが開くため、
-    // 未割り当てのダミーキー (0xE8) を挟んでから Win キーを離し、「他のキーと組み合わせた」扱いにする
-    static void ReleaseWinWithoutStartMenu(byte winVk)
-    {
-        Native.keybd_event(Native.VK_DUMMY, 0, 0, Native.OwnInputSignature);
-        Native.keybd_event(Native.VK_DUMMY, 0, Native.KEYEVENTF_KEYUP, Native.OwnInputSignature);
-        Native.keybd_event(winVk, 0, Native.KEYEVENTF_KEYUP | Native.KEYEVENTF_EXTENDEDKEY, Native.OwnInputSignature);
     }
 
     void ShowOverlay()
@@ -233,7 +227,6 @@ sealed class ZoomContext : ApplicationContext
 
     void OnOverlayWheel(int delta, Point cursor)
     {
-        zoomedDuringWin = true; // 判定待ちの間に Win キーが離されてもスタートメニューを抑止する
         long now = clock.ElapsedMilliseconds;
         bool mouse = now - lastRawWheelMs <= RawRecentMs && Math.Sign(delta) == lastRawWheelSign;
         if (mouse)
@@ -301,13 +294,16 @@ sealed class ZoomContext : ApplicationContext
     void OnZoomWheel(int delta, Point cursor)
     {
         SetLevel((float)(level * Math.Pow(StepPerNotch, delta / 120.0)), cursor);
-        zoomedDuringWin = true;
     }
 
-    static bool IsWinKeyDown()
+    static bool IsModifierDown()
     {
-        return (Native.GetAsyncKeyState(Native.VK_LWIN) & 0x8000) != 0
-            || (Native.GetAsyncKeyState(Native.VK_RWIN) & 0x8000) != 0;
+        return IsKeyDown(Native.VK_CONTROL) && IsKeyDown(Native.VK_SHIFT);
+    }
+
+    static bool IsKeyDown(int vk)
+    {
+        return (Native.GetAsyncKeyState(vk) & 0x8000) != 0;
     }
 
     void SetLevel(float newLevel, Point cursor)
@@ -315,13 +311,42 @@ sealed class ZoomContext : ApplicationContext
         if (newLevel < 1.02f) newLevel = 1f; // 端数が残らないよう等倍にスナップ
         if (newLevel > MaxLevel) newLevel = MaxLevel;
         if (newLevel == level) return;
+
+        Rectangle screen = VirtualScreen();
+        if (level <= 1f)
+        {
+            viewX = screen.Left;
+            viewY = screen.Top;
+        }
+        // カーソルが画面上の同じ位置に見えたままになるよう、カーソルを中心に拡大/縮小する
+        viewX = cursor.X - (cursor.X - viewX) * level / newLevel;
+        viewY = cursor.Y - (cursor.Y - viewY) * level / newLevel;
         level = newLevel;
-        ApplyTransform(cursor);
+        ApplyTransform();
         UpdateTooltip();
     }
 
-    // カーソル位置が画面上の同じ位置に見えるよう、拡大領域をカーソルに比例して移動させる
-    void ApplyTransform(Point cursor)
+    // カーソルが拡大表示している領域の端を越えたときだけ、越えた分だけ領域を動かす
+    void FollowCursor(Point cursor)
+    {
+        Rectangle screen = VirtualScreen();
+        double viewWidth = screen.Width / level;
+        double viewHeight = screen.Height / level;
+        double x = viewX;
+        double y = viewY;
+
+        if (cursor.X < x) x = cursor.X;
+        else if (cursor.X > x + viewWidth - 1) x = cursor.X - viewWidth + 1;
+        if (cursor.Y < y) y = cursor.Y;
+        else if (cursor.Y > y + viewHeight - 1) y = cursor.Y - viewHeight + 1;
+
+        if (x == viewX && y == viewY) return;
+        viewX = x;
+        viewY = y;
+        ApplyTransform();
+    }
+
+    void ApplyTransform()
     {
         if (level <= 1f)
         {
@@ -329,18 +354,22 @@ sealed class ZoomContext : ApplicationContext
             return;
         }
 
-        int left = Native.GetSystemMetrics(Native.SM_XVIRTUALSCREEN);
-        int top = Native.GetSystemMetrics(Native.SM_YVIRTUALSCREEN);
-        int width = Native.GetSystemMetrics(Native.SM_CXVIRTUALSCREEN);
-        int height = Native.GetSystemMetrics(Native.SM_CYVIRTUALSCREEN);
-
-        double ratio = 1.0 - 1.0 / level;
-        int x = Clamp(left + (int)Math.Round((cursor.X - left) * ratio), left, left + (int)(width * ratio));
-        int y = Clamp(top + (int)Math.Round((cursor.Y - top) * ratio), top, top + (int)(height * ratio));
-        Native.MagSetFullscreenTransform(level, x, y);
+        Rectangle screen = VirtualScreen();
+        viewX = Clamp(viewX, screen.Left, screen.Right - screen.Width / level);
+        viewY = Clamp(viewY, screen.Top, screen.Bottom - screen.Height / level);
+        Native.MagSetFullscreenTransform(level, (int)Math.Round(viewX), (int)Math.Round(viewY));
     }
 
-    static int Clamp(int v, int min, int max)
+    static Rectangle VirtualScreen()
+    {
+        return new Rectangle(
+            Native.GetSystemMetrics(Native.SM_XVIRTUALSCREEN),
+            Native.GetSystemMetrics(Native.SM_YVIRTUALSCREEN),
+            Native.GetSystemMetrics(Native.SM_CXVIRTUALSCREEN),
+            Native.GetSystemMetrics(Native.SM_CYVIRTUALSCREEN));
+    }
+
+    static double Clamp(double v, double min, double max)
     {
         return v < min ? min : (v > max ? max : v);
     }
@@ -366,20 +395,76 @@ sealed class ZoomContext : ApplicationContext
 
     static bool IsStartupRegistered()
     {
-        using (var key = Registry.CurrentUser.OpenSubKey(RunKey))
-        {
-            return key != null && key.GetValue(RunValue) != null;
-        }
+        return RunSchtasks("/Query /TN \"" + TaskName + "\"") == 0;
     }
 
     void ToggleStartup()
     {
-        using (var key = Registry.CurrentUser.CreateSubKey(RunKey))
-        {
-            if (IsStartupRegistered()) key.DeleteValue(RunValue, false);
-            else key.SetValue(RunValue, "\"" + Application.ExecutablePath + "\"");
-        }
+        if (IsStartupRegistered()) RunSchtasks("/Delete /TN \"" + TaskName + "\" /F");
+        else RegisterStartupTask();
         startupItem.Checked = IsStartupRegistered();
+    }
+
+    // 以前の版が Run キーに登録した自動起動は管理者権限では機能しないため、タスクスケジューラへ移す
+    static void MigrateLegacyStartup()
+    {
+        using (var key = Registry.CurrentUser.OpenSubKey(LegacyRunKey, true))
+        {
+            if (key == null || key.GetValue(LegacyRunValue) == null) return;
+            key.DeleteValue(LegacyRunValue, false);
+        }
+        RegisterStartupTask();
+    }
+
+    // ログオン時に「最上位の特権」で起動するタスクを登録する (UAC の確認なしで管理者権限になる)。
+    // ノートPCでバッテリー駆動中も起動・継続するよう、電源条件を外すため XML で定義する。
+    static void RegisterStartupTask()
+    {
+        string user = SecurityElement.Escape(WindowsIdentity.GetCurrent().Name);
+        string xml =
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n" +
+            "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n" +
+            "  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + user + "</UserId></LogonTrigger></Triggers>\n" +
+            "  <Principals><Principal id=\"Author\"><UserId>" + user + "</UserId>" +
+            "<LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>\n" +
+            "  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>" +
+            "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" +
+            "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>" +
+            "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>4</Priority></Settings>\n" +
+            "  <Actions Context=\"Author\"><Exec><Command>" + SecurityElement.Escape(Application.ExecutablePath) +
+            "</Command></Exec></Actions>\n" +
+            "</Task>\n";
+
+        string path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(path, xml, Encoding.Unicode);
+            if (RunSchtasks("/Create /TN \"" + TaskName + "\" /XML \"" + path + "\" /F") != 0)
+            {
+                MessageBox.Show("タスクスケジューラへの登録に失敗しました。", "ScreenZoom",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    static int RunSchtasks(string arguments)
+    {
+        var psi = new ProcessStartInfo("schtasks.exe", arguments);
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        using (var process = Process.Start(psi))
+        {
+            process.StandardOutput.ReadToEnd();
+            process.StandardError.ReadToEnd();
+            process.WaitForExit();
+            return process.ExitCode;
+        }
     }
 
     static Icon CreateIcon()
@@ -525,13 +610,12 @@ static class Native
     public const uint RID_INPUT = 0x10000003;
     public const uint RIM_TYPEMOUSE = 0;
     public const ushort RI_MOUSE_WHEEL = 0x0400;
-    public const int VK_LWIN = 0x5B;
-    public const int VK_RWIN = 0x5C;
-    public const byte VK_DUMMY = 0xE8;
-    public const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
-    public const uint KEYEVENTF_KEYUP = 0x0002;
-    // 自分で送ったキー入力をキーボードフックで見分けるための目印
-    public static readonly UIntPtr OwnInputSignature = new UIntPtr(0x5A4F4F4D);
+    public const int VK_SHIFT = 0x10;
+    public const int VK_CONTROL = 0x11;
+    public const int VK_LSHIFT = 0xA0;
+    public const int VK_RSHIFT = 0xA1;
+    public const int VK_LCONTROL = 0xA2;
+    public const int VK_RCONTROL = 0xA3;
     public const int SM_XVIRTUALSCREEN = 76;
     public const int SM_YVIRTUALSCREEN = 77;
     public const int SM_CXVIRTUALSCREEN = 78;
@@ -603,9 +687,6 @@ static class Native
 
     [DllImport("user32.dll")]
     public static extern short GetAsyncKeyState(int vKey);
-
-    [DllImport("user32.dll")]
-    public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
     [DllImport("user32.dll")]
     public static extern int GetSystemMetrics(int nIndex);
