@@ -2,6 +2,7 @@
 // Win キーを押しながらホイールを回すと画面全体を拡大/縮小し、拡大中はカーソルに追従する。
 // .NET Framework 4.x 付属の csc.exe (C# 5) でビルドできるよう、新しい言語機能は使わない。
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
@@ -49,6 +50,11 @@ sealed class ZoomContext : ApplicationContext
     readonly IntPtr keyHookHandle;
     readonly OverlayForm overlay;
     readonly System.Windows.Forms.Timer overlayWatch;
+    readonly System.Windows.Forms.Timer sourceTimer;
+    // 透明ウィンドウに届いたが、入力元 (マウスかタッチパッドか) が未確定のスクロール
+    readonly List<WheelEvent> pendingWheels = new List<WheelEvent>();
+    // Raw Input で届いた、マウス本体のホイール操作 (透明ウィンドウ側のスクロールと突き合わせる)
+    readonly List<WheelEvent> rawMouseWheels = new List<WheelEvent>();
     readonly NotifyIcon tray;
     readonly ToolStripMenuItem enabledItem;
     readonly ToolStripMenuItem startupItem;
@@ -72,14 +78,11 @@ sealed class ZoomContext : ApplicationContext
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
 
-        // マウスホイールはマウスフックで消費されるため、透明ウィンドウに届くのはタッチパッドのスクロールだけ。
-        // タッチパッドは指の動きとズーム方向を合わせるため、向きを逆にする。
-        overlay = new OverlayForm((delta, cursor) =>
-        {
-            DebugLog.Write(string.Format("wheel path=overlay delta={0} extra=0x{1:X}",
-                delta, Native.GetMessageExtraInfo().ToInt64()));
-            OnZoomWheel(-delta, cursor);
-        });
+        overlay = new OverlayForm(OnOverlayWheel, OnRawInput);
+        RegisterRawMouseInput();
+        sourceTimer = new System.Windows.Forms.Timer();
+        sourceTimer.Interval = 10;
+        sourceTimer.Tick += delegate { ResolveWheelSources(); };
         // Win+L 等でキーを離したことを取りこぼしても透明ウィンドウが残り続けないよう定期確認する
         overlayWatch = new System.Windows.Forms.Timer();
         overlayWatch.Interval = 200;
@@ -124,6 +127,10 @@ sealed class ZoomContext : ApplicationContext
                         (short)((info.mouseData >> 16) & 0xFFFF), info.flags, info.dwExtraInfo.ToInt64(), IsWinKeyDown()));
                     if (enabled && IsWinKeyDown())
                     {
+                        // 透明ウィンドウが出ていれば、そちらで入力元を判定してズームする。
+                        // ここで止めると Raw Input も届かなくなるため、通過させる。
+                        if (overlay.IsShown) return Native.CallNextHookEx(hookHandle, nCode, wParam, lParam);
+
                         OnZoomWheel((short)((info.mouseData >> 16) & 0xFFFF), pt);
                         return new IntPtr(1); // ホイール入力自体はアプリに渡さない
                     }
@@ -197,6 +204,113 @@ sealed class ZoomContext : ApplicationContext
     {
         overlayWatch.Stop();
         overlay.HideOverlay();
+    }
+
+    // マウスとタッチパッドのスクロールは、マウスフックでも透明ウィンドウでも同じ形で届き区別できない。
+    // マウス本体のホイール操作だけが Raw Input に入力元の機器付きで届くため、
+    // 同じスクロール量の Raw Input が前後 SourceWaitMs 以内にあればマウス、なければタッチパッドとみなす。
+    const int SourceWaitMs = 40;
+    const int RawKeepMs = 200;
+
+    sealed class WheelEvent
+    {
+        public int Delta;
+        public Point Cursor;
+        public int Tick;
+    }
+
+    void RegisterRawMouseInput()
+    {
+        var device = new Native.RAWINPUTDEVICE();
+        device.usUsagePage = 0x01; // Generic Desktop
+        device.usUsage = 0x02;     // Mouse
+        device.dwFlags = Native.RIDEV_INPUTSINK; // 非アクティブでも受け取る
+        device.hwndTarget = overlay.Handle;
+        if (!Native.RegisterRawInputDevices(new[] { device }, 1, (uint)Marshal.SizeOf(typeof(Native.RAWINPUTDEVICE))))
+        {
+            DebugLog.Write("RegisterRawInputDevices failed: " + Marshal.GetLastWin32Error());
+        }
+    }
+
+    void OnOverlayWheel(int delta, Point cursor)
+    {
+        zoomedDuringWin = true; // 判定待ちの間に Win キーが離されてもスタートメニューを抑止する
+        WheelEvent raw = TakeMatching(rawMouseWheels, delta);
+        DebugLog.Write(string.Format("wheel path=overlay delta={0} source={1}", delta, raw != null ? "mouse" : "pending"));
+        if (raw != null)
+        {
+            OnZoomWheel(delta, cursor);
+            return;
+        }
+        pendingWheels.Add(new WheelEvent { Delta = delta, Cursor = cursor, Tick = Environment.TickCount });
+        sourceTimer.Start();
+    }
+
+    void OnRawInput(IntPtr hRawInput)
+    {
+        uint size = 0;
+        uint headerSize = (uint)Marshal.SizeOf(typeof(Native.RAWINPUTHEADER));
+        Native.GetRawInputData(hRawInput, Native.RID_INPUT, IntPtr.Zero, ref size, headerSize);
+        if (size == 0) return;
+
+        IntPtr buffer = Marshal.AllocHGlobal((int)size);
+        try
+        {
+            if (Native.GetRawInputData(hRawInput, Native.RID_INPUT, buffer, ref size, headerSize) != size) return;
+            var header = (Native.RAWINPUTHEADER)Marshal.PtrToStructure(buffer, typeof(Native.RAWINPUTHEADER));
+            if (header.dwType != Native.RIM_TYPEMOUSE) return;
+
+            // RAWMOUSE: usFlags(2) + padding(2) + usButtonFlags(2) + usButtonData(2)
+            IntPtr mouse = IntPtr.Add(buffer, (int)headerSize);
+            ushort buttonFlags = (ushort)Marshal.ReadInt16(mouse, 4);
+            if ((buttonFlags & Native.RI_MOUSE_WHEEL) == 0) return;
+            int delta = Marshal.ReadInt16(mouse, 6);
+
+            DebugLog.Write(string.Format("raw wheel delta={0} device=0x{1:X}", delta, header.hDevice.ToInt64()));
+            if (header.hDevice == IntPtr.Zero) return; // 機器を特定できない入力 (タッチパッド由来の可能性) は扱わない
+
+            WheelEvent pending = TakeMatching(pendingWheels, delta);
+            if (pending != null)
+            {
+                OnZoomWheel(pending.Delta, pending.Cursor);
+            }
+            else
+            {
+                rawMouseWheels.Add(new WheelEvent { Delta = delta, Tick = Environment.TickCount });
+                sourceTimer.Start();
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    // 判定待ちのまま SourceWaitMs 経ったスクロールはタッチパッドとして扱う
+    void ResolveWheelSources()
+    {
+        int now = Environment.TickCount;
+        while (pendingWheels.Count > 0 && now - pendingWheels[0].Tick >= SourceWaitMs)
+        {
+            WheelEvent e = pendingWheels[0];
+            pendingWheels.RemoveAt(0);
+            DebugLog.Write(string.Format("wheel resolved delta={0} source=touchpad", e.Delta));
+            // タッチパッドは指の動きとズーム方向を合わせるため、向きを逆にする
+            OnZoomWheel(-e.Delta, e.Cursor);
+        }
+        rawMouseWheels.RemoveAll(e => now - e.Tick > RawKeepMs);
+        if (pendingWheels.Count == 0 && rawMouseWheels.Count == 0) sourceTimer.Stop();
+    }
+
+    static WheelEvent TakeMatching(List<WheelEvent> list, int delta)
+    {
+        int now = Environment.TickCount;
+        list.RemoveAll(e => now - e.Tick > RawKeepMs);
+        int index = list.FindIndex(e => e.Delta == delta);
+        if (index < 0) return null;
+        WheelEvent found = list[index];
+        list.RemoveAt(index);
+        return found;
     }
 
     void OnZoomWheel(int delta, Point cursor)
@@ -312,6 +426,7 @@ sealed class ZoomContext : ApplicationContext
         if (hookHandle != IntPtr.Zero) Native.UnhookWindowsHookEx(hookHandle);
         if (keyHookHandle != IntPtr.Zero) Native.UnhookWindowsHookEx(keyHookHandle);
         overlayWatch.Stop();
+        sourceTimer.Stop();
         overlay.Dispose();
         Native.MagSetFullscreenTransform(1f, 0, 0);
         Native.MagUninitialize();
@@ -352,12 +467,14 @@ sealed class OverlayForm : Form
     const int MA_NOACTIVATE = 3;
 
     readonly Action<int, Point> onWheel;
+    readonly Action<IntPtr> onRawInput;
 
     public bool IsShown { get; private set; }
 
-    public OverlayForm(Action<int, Point> onWheel)
+    public OverlayForm(Action<int, Point> onWheel, Action<IntPtr> onRawInput)
     {
         this.onWheel = onWheel;
+        this.onRawInput = onRawInput;
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
@@ -399,6 +516,12 @@ sealed class OverlayForm : Form
 
     protected override void WndProc(ref Message m)
     {
+        if (m.Msg == Native.WM_INPUT)
+        {
+            onRawInput(m.LParam);
+            base.WndProc(ref m); // 後始末のため DefWindowProc に渡す
+            return;
+        }
         if (m.Msg == Native.WM_MOUSEWHEEL)
         {
             onWheel((short)((m.WParam.ToInt64() >> 16) & 0xFFFF), Cursor.Position);
@@ -428,6 +551,11 @@ static class Native
     public const int SW_HIDE = 0;
     public const int WM_MOUSEMOVE = 0x0200;
     public const int WM_MOUSEWHEEL = 0x020A;
+    public const int WM_INPUT = 0x00FF;
+    public const uint RIDEV_INPUTSINK = 0x00000100;
+    public const uint RID_INPUT = 0x10000003;
+    public const uint RIM_TYPEMOUSE = 0;
+    public const ushort RI_MOUSE_WHEEL = 0x0400;
     public const int VK_LWIN = 0x5B;
     public const int VK_RWIN = 0x5C;
     public const byte VK_DUMMY = 0xE8;
@@ -465,8 +593,29 @@ static class Native
         public UIntPtr dwExtraInfo;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RAWINPUTDEVICE
+    {
+        public ushort usUsagePage;
+        public ushort usUsage;
+        public uint dwFlags;
+        public IntPtr hwndTarget;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RAWINPUTHEADER
+    {
+        public uint dwType;
+        public uint dwSize;
+        public IntPtr hDevice;
+        public IntPtr wParam;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] pRawInputDevices, uint uiNumDevices, uint cbSize);
+
     [DllImport("user32.dll")]
-    public static extern IntPtr GetMessageExtraInfo();
+    public static extern uint GetRawInputData(IntPtr hRawInput, uint uiCommand, IntPtr pData, ref uint pcbSize, uint cbSizeHeader);
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern IntPtr SetWindowsHookEx(int idHook, LowLevelHookProc lpfn, IntPtr hMod, uint dwThreadId);
