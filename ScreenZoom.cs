@@ -70,7 +70,9 @@ sealed class ZoomContext : ApplicationContext
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
 
-        overlay = new OverlayForm(OnZoomWheel);
+        // マウスホイールはマウスフックで消費されるため、透明ウィンドウに届くのはタッチパッドのスクロールだけ。
+        // タッチパッドは指の動きとズーム方向を合わせるため、向きを逆にする。
+        overlay = new OverlayForm((delta, cursor) => OnZoomWheel(-delta, cursor));
         // Win+L 等でキーを離したことを取りこぼしても透明ウィンドウが残り続けないよう定期確認する
         overlayWatch = new System.Windows.Forms.Timer();
         overlayWatch.Interval = 200;
