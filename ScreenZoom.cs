@@ -1,5 +1,5 @@
 // ScreenZoom: macOS のアクセシビリティズームを Windows で再現する常駐ツール。
-// Ctrl+Shift を押しながらホイールを回すと画面全体を拡大/縮小し、拡大中はカーソルに追従する。
+// Ctrl+Alt を押しながらホイールを回すと画面全体を拡大/縮小し、拡大中はカーソルに追従する。
 // 管理者権限のウィンドウ (タスクマネージャー等) 上でも入力を捕捉できるよう、管理者権限で動かす (ScreenZoom.manifest)。
 // .NET Framework 4.x 付属の csc.exe (C# 5) でビルドできるよう、新しい言語機能は使わない。
 //
@@ -99,11 +99,11 @@ sealed class ZoomContext : ApplicationContext
     readonly System.Windows.Forms.Timer sourceTimer;
     readonly System.Windows.Forms.Timer hookWatch;
     bool transformPending;    // 画面の拡大の更新を予約済みか
-    bool overlayWanted;       // Ctrl+Shift が押されていて透明ウィンドウを出すべきか
+    bool overlayWanted;       // Ctrl+Alt が押されていて透明ウィンドウを出すべきか
     bool overlayUpdatePending;
     Point lastHookCursor;     // マウスフックが最後に受け取ったカーソル位置
     long lastMouseHookMs;
-    long modifierWithoutOverlayMs = -1; // Ctrl+Shift が押されているのに透明ウィンドウが出ていない状態になった時刻
+    long modifierWithoutOverlayMs = -1; // Ctrl+Alt が押されているのに透明ウィンドウが出ていない状態になった時刻
     // 透明ウィンドウに届いたが、入力元 (マウスかタッチパッドか) が未確定のスクロール
     readonly List<WheelEvent> pendingWheels = new List<WheelEvent>();
     readonly Stopwatch clock = Stopwatch.StartNew();
@@ -193,7 +193,7 @@ sealed class ZoomContext : ApplicationContext
     {
         long now = clock.ElapsedMilliseconds;
 
-        // キーボードフック: Ctrl+Shift が押されたままなのに透明ウィンドウを出す指示が来ていない
+        // キーボードフック: Ctrl+Alt が押されたままなのに透明ウィンドウを出す指示が来ていない
         bool keyboardDead = false;
         if (enabled && IsModifierDown() && !overlayWanted)
         {
@@ -275,7 +275,7 @@ sealed class ZoomContext : ApplicationContext
     }
 
     // 高精度タッチパッドの二本指スクロールは Chrome やエクスプローラー等へ直接届き、
-    // マウスフックでは捕捉できない。Ctrl+Shift を押している間だけ透明ウィンドウを最前面に置き、
+    // マウスフックでは捕捉できない。Ctrl+Alt を押している間だけ透明ウィンドウを最前面に置き、
     // スクロールをそのウィンドウで受け取ることでアプリへ届かないようにする。
     IntPtr KeyHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
@@ -283,15 +283,15 @@ sealed class ZoomContext : ApplicationContext
         {
             var info = (Native.KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.KBDLLHOOKSTRUCT));
             bool isCtrl = info.vkCode == Native.VK_LCONTROL || info.vkCode == Native.VK_RCONTROL;
-            bool isShift = info.vkCode == Native.VK_LSHIFT || info.vkCode == Native.VK_RSHIFT;
-            if (isCtrl || isShift)
+            bool isAlt = info.vkCode == Native.VK_LMENU || info.vkCode == Native.VK_RMENU;
+            if (isCtrl || isAlt)
             {
                 int msg = wParam.ToInt32();
                 bool pressed = msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN;
                 // フック内ではこのキーの状態がまだ反映されていないため、このキーだけはイベントから判断する
                 bool ctrl = isCtrl ? pressed : IsKeyDown(Native.VK_CONTROL);
-                bool shift = isShift ? pressed : IsKeyDown(Native.VK_SHIFT);
-                overlayWanted = ctrl && shift;
+                bool alt = isAlt ? pressed : IsKeyDown(Native.VK_MENU);
+                overlayWanted = ctrl && alt;
                 RequestOverlayUpdate();
             }
         }
@@ -426,7 +426,7 @@ sealed class ZoomContext : ApplicationContext
 
     static bool IsModifierDown()
     {
-        return IsKeyDown(Native.VK_CONTROL) && IsKeyDown(Native.VK_SHIFT);
+        return IsKeyDown(Native.VK_CONTROL) && IsKeyDown(Native.VK_MENU);
     }
 
     static bool IsKeyDown(int vk)
@@ -884,10 +884,10 @@ static class Native
     public const uint RID_INPUT = 0x10000003;
     public const uint RIM_TYPEMOUSE = 0;
     public const ushort RI_MOUSE_WHEEL = 0x0400;
-    public const int VK_SHIFT = 0x10;
+    public const int VK_MENU = 0x12; // Alt
     public const int VK_CONTROL = 0x11;
-    public const int VK_LSHIFT = 0xA0;
-    public const int VK_RSHIFT = 0xA1;
+    public const int VK_LMENU = 0xA4;
+    public const int VK_RMENU = 0xA5;
     public const int VK_LCONTROL = 0xA2;
     public const int VK_RCONTROL = 0xA3;
     public const int SM_XVIRTUALSCREEN = 76;
