@@ -5,7 +5,8 @@
 //
 // 管理者権限で動くため、exe と同じフォルダに置かれたファイルを読み込んだり、
 // 一般ユーザーが書き換えられる場所の exe を自動起動 (最上位の特権) に登録したりしないこと。
-// 自動起動は install.bat で Program Files にインストールした exe からのみ登録できる。
+// 自動起動は、管理者以外が置き換えられないことをアクセス権で確かめられた exe (install.bat で
+// Program Files にインストールしたもの) からのみ登録できる。
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -14,6 +15,7 @@ using System.Drawing.Drawing2D;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security;
+using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
@@ -32,8 +34,9 @@ static class Program
         bool createdNew;
         using (var mutex = new Mutex(true, "ScreenZoom_SingleInstance", out createdNew))
         {
-            // ミューテックスは他のプログラムからも作れるため、実際に ScreenZoom が動いているときだけ二重起動とみなす
-            if (!createdNew && Process.GetProcessesByName("ScreenZoom").Length > 1) return;
+            // ミューテックスや同名のプロセスは他のプログラムからも作れるため、
+            // 同じ exe の ScreenZoom が実際に動いているときだけ二重起動とみなす
+            if (!createdNew && IsSameExeRunning()) return;
 
             // カーソル座標と画面サイズを物理ピクセルで扱うため Per-Monitor V2 を宣言
             try { Native.SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch (EntryPointNotFoundException) { }
@@ -48,6 +51,26 @@ static class Program
             Application.EnableVisualStyles();
             Application.Run(new ZoomContext());
         }
+    }
+
+    static bool IsSameExeRunning()
+    {
+        string self = Application.ExecutablePath;
+        int selfId = Process.GetCurrentProcess().Id;
+        foreach (Process p in Process.GetProcessesByName("ScreenZoom"))
+        {
+            using (p)
+            {
+                if (p.Id == selfId) continue;
+                try
+                {
+                    if (string.Equals(p.MainModule.FileName, self, StringComparison.OrdinalIgnoreCase)) return true;
+                }
+                catch (System.ComponentModel.Win32Exception) { }  // 終了済みやアクセスできないプロセスは別物とみなす
+                catch (InvalidOperationException) { }
+            }
+        }
+        return false;
     }
 }
 
@@ -196,8 +219,18 @@ sealed class ZoomContext : ApplicationContext
         startupItem.Enabled = false;
         ThreadPool.QueueUserWorkItem(delegate
         {
-            string notice = work();
-            bool registered = QueryStartupTaskCommand() != null;
+            string notice;
+            bool registered = false;
+            // 別スレッドで例外が起きるとプロセスごと終了するため、すべて受け止めて通知に回す
+            try
+            {
+                notice = work();
+                registered = QueryStartupTaskCommand() != null;
+            }
+            catch (Exception ex)
+            {
+                notice = "自動起動の設定中にエラーが発生しました: " + ex.Message;
+            }
             overlay.BeginInvoke((Action)delegate
             {
                 startupItem.Checked = registered;
@@ -503,19 +536,76 @@ sealed class ZoomContext : ApplicationContext
 
     // 自動起動のタスクは管理者権限で exe を起動するため、一般ユーザーが exe を置き換えられる場所の exe を
     // 登録すると、置き換えた exe が UAC の確認なしに管理者権限で動いてしまう。
-    // そのため管理者しか書き込めない Program Files 配下の exe だけを登録対象にする。
-    static readonly bool InstalledSecurely = IsSecureLocation(Application.ExecutablePath);
+    // そのため、管理者以外が exe を置き換えられないことをアクセス権で確かめられた exe だけを登録対象にする。
+    static readonly bool InstalledSecurely;
+
+    // 静的フィールドの初期化子は記述順に実行されるため、TrustedSids などがすべて初期化された後に判定する
+    static ZoomContext()
+    {
+        InstalledSecurely = IsSecureLocation(Application.ExecutablePath);
+    }
+
+    // 管理者・SYSTEM・TrustedInstaller・CREATOR OWNER 以外は、書き込み権限を持っていてはならない
+    static readonly SecurityIdentifier[] TrustedSids =
+    {
+        new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+        new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+        new SecurityIdentifier("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"), // TrustedInstaller
+        new SecurityIdentifier(WellKnownSidType.CreatorOwnerSid, null),
+    };
+
+    // exe と同じフォルダ: 書き換え・ファイルの追加 (DLL の設置)・削除・権限変更ができてはならない
+    const FileSystemRights ReplaceRights =
+        FileSystemRights.WriteData | FileSystemRights.AppendData | FileSystemRights.Delete |
+        FileSystemRights.DeleteSubdirectoriesAndFiles | FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership;
+    // それより上のフォルダ: 配下のフォルダを削除・名前変更して差し替えたり、権限を変えたりできてはならない
+    const FileSystemRights AncestorRights =
+        FileSystemRights.Delete | FileSystemRights.DeleteSubdirectoriesAndFiles |
+        FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership;
+
+    // ACE には汎用権限 (GENERIC_WRITE / GENERIC_ALL) がそのまま入っている場合がある
+    const FileSystemRights GenericWriteRights = (FileSystemRights)0x50000000;
 
     static bool IsSecureLocation(string exePath)
     {
-        string root = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles).TrimEnd('\\') + "\\";
         try
         {
-            return Path.GetFullPath(exePath).StartsWith(root, StringComparison.OrdinalIgnoreCase);
+            string path = Path.GetFullPath(exePath);
+            if (!File.Exists(path)) return false;
+            if (!IsProtected(File.GetAccessControl(path), ReplaceRights)) return false;
+
+            var dir = new DirectoryInfo(Path.GetDirectoryName(path));
+            FileSystemRights rights = ReplaceRights;
+            for (; dir != null; dir = dir.Parent, rights = AncestorRights)
+            {
+                // ジャンクションやシンボリックリンクを経由すると実体の場所が変わるため、安全とみなさない
+                if ((dir.Attributes & FileAttributes.ReparsePoint) != 0) return false;
+                if (!IsProtected(dir.GetAccessControl(), rights)) return false;
+            }
+            return true;
         }
-        catch (ArgumentException) { return false; }
-        catch (NotSupportedException) { return false; }
-        catch (PathTooLongException) { return false; }
+        catch (Exception)
+        {
+            return false; // パスやアクセス権を確かめられないものは安全とみなさない
+        }
+    }
+
+    static bool IsProtected(FileSystemSecurity security, FileSystemRights forbidden)
+    {
+        if (!IsTrusted(security.GetOwner(typeof(SecurityIdentifier)))) return false; // 所有者は権限を変更できる
+        foreach (FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+        {
+            if (rule.AccessControlType != AccessControlType.Allow) continue;
+            if ((rule.PropagationFlags & PropagationFlags.InheritOnly) != 0) continue; // このオブジェクト自体には効かない
+            if ((rule.FileSystemRights & (forbidden | GenericWriteRights)) == 0) continue;
+            if (!IsTrusted(rule.IdentityReference)) return false;
+        }
+        return true;
+    }
+
+    static bool IsTrusted(IdentityReference identity)
+    {
+        return Array.IndexOf(TrustedSids, identity as SecurityIdentifier) >= 0;
     }
 
     void ToggleStartup()
@@ -524,9 +614,12 @@ sealed class ZoomContext : ApplicationContext
         bool register = !startupItem.Checked;
         RunStartupTaskInBackground(delegate
         {
-            if (register) RegisterStartupTask();
-            else DeleteStartupTask();
-            return null;
+            if (!register)
+            {
+                DeleteStartupTask();
+                return null;
+            }
+            return RegisterStartupTask() ? null : "タスクスケジューラへの登録に失敗しました。";
         });
     }
 
@@ -554,16 +647,17 @@ sealed class ZoomContext : ApplicationContext
             notice = "一般ユーザーが書き換えられる場所の exe を指していたため、自動起動を解除しました。" +
                      "install.bat でインストールしてから、改めて自動起動を有効にしてください。";
         }
-        else if (command != null && InstalledSecurely &&
-                 !string.Equals(Path.GetFullPath(command), Path.GetFullPath(Application.ExecutablePath), StringComparison.OrdinalIgnoreCase))
+        else if (command != null && InstalledSecurely)
         {
-            RegisterStartupTask(); // インストール先が変わった場合は今の exe を指すように登録し直す
+            // 確認しているのは起動する exe だけなので、引数・追加の操作・権限などが書き換えられていても
+            // 元に戻るよう、毎回 ScreenZoom 自身の定義で登録し直す (インストール先が変わった場合もここで追従する)
+            if (!RegisterStartupTask()) notice = "自動起動の登録の更新に失敗しました。";
         }
 
         if (hadLegacy && command == null)
         {
-            if (InstalledSecurely) RegisterStartupTask();
-            else notice = "以前の自動起動の設定を解除しました。install.bat でインストールしてから、改めて自動起動を有効にしてください。";
+            if (!InstalledSecurely) notice = "以前の自動起動の設定を解除しました。install.bat でインストールしてから、改めて自動起動を有効にしてください。";
+            else if (!RegisterStartupTask()) notice = "タスクスケジューラへの登録に失敗しました。";
         }
         return notice;
     }
@@ -594,9 +688,9 @@ sealed class ZoomContext : ApplicationContext
 
     // ログオン時に「最上位の特権」で起動するタスクを登録する (UAC の確認なしで管理者権限になる)。
     // ノートPCでバッテリー駆動中も起動・継続するよう、電源条件を外すため XML で定義する。
-    static void RegisterStartupTask()
+    static bool RegisterStartupTask()
     {
-        if (!InstalledSecurely) return;
+        if (!InstalledSecurely) return false;
 
         string user = SecurityElement.Escape(WindowsIdentity.GetCurrent().Name);
         string xml =
@@ -620,11 +714,7 @@ sealed class ZoomContext : ApplicationContext
         {
             File.WriteAllText(path, xml, Encoding.Unicode);
             string output;
-            if (RunSchtasks("/Create /TN \"" + TaskName + "\" /XML \"" + path + "\" /F", out output) != 0)
-            {
-                MessageBox.Show("タスクスケジューラへの登録に失敗しました。", "ScreenZoom",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
+            return RunSchtasks("/Create /TN \"" + TaskName + "\" /XML \"" + path + "\" /F", out output) == 0;
         }
         finally
         {
