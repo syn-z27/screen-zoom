@@ -1,6 +1,5 @@
-// ScreenZoom: macOS のアクセシビリティズーム (Ctrl + スクロール) を Windows で再現する常駐ツール。
-// アプリ側の Ctrl+ホイールと衝突しないよう、Windows では Win キーを押しながらホイールを回すと
-// 画面全体を拡大/縮小し、拡大中はカーソルに追従する。
+// ScreenZoom: macOS のアクセシビリティズームを Windows で再現する常駐ツール。
+// Win キーを押しながらホイールを回すと画面全体を拡大/縮小し、拡大中はカーソルに追従する。
 // .NET Framework 4.x 付属の csc.exe (C# 5) でビルドできるよう、新しい言語機能は使わない。
 using System;
 using System.Drawing;
