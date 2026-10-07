@@ -55,6 +55,8 @@ sealed class ZoomContext : ApplicationContext
 
     float level = 1f;
     bool enabled = true;
+    bool winDown;
+    bool zoomedDuringWin; // 今回の Win キー押下中にズームしたか
 
     public ZoomContext()
     {
@@ -72,7 +74,12 @@ sealed class ZoomContext : ApplicationContext
 
         // マウスホイールはマウスフックで消費されるため、透明ウィンドウに届くのはタッチパッドのスクロールだけ。
         // タッチパッドは指の動きとズーム方向を合わせるため、向きを逆にする。
-        overlay = new OverlayForm((delta, cursor) => OnZoomWheel(-delta, cursor));
+        overlay = new OverlayForm((delta, cursor) =>
+        {
+            DebugLog.Write(string.Format("wheel path=overlay delta={0} extra=0x{1:X}",
+                delta, Native.GetMessageExtraInfo().ToInt64()));
+            OnZoomWheel(-delta, cursor);
+        });
         // Win+L 等でキーを離したことを取りこぼしても透明ウィンドウが残り続けないよう定期確認する
         overlayWatch = new System.Windows.Forms.Timer();
         overlayWatch.Interval = 200;
@@ -113,6 +120,8 @@ sealed class ZoomContext : ApplicationContext
 
                 if (msg == Native.WM_MOUSEWHEEL)
                 {
+                    DebugLog.Write(string.Format("wheel path=hook delta={0} flags=0x{1:X} extra=0x{2:X} win={3}",
+                        (short)((info.mouseData >> 16) & 0xFFFF), info.flags, info.dwExtraInfo.ToInt64(), IsWinKeyDown()));
                     if (enabled && IsWinKeyDown())
                     {
                         OnZoomWheel((short)((info.mouseData >> 16) & 0xFFFF), pt);
@@ -135,21 +144,46 @@ sealed class ZoomContext : ApplicationContext
     {
         if (nCode >= 0)
         {
-            int vk = Marshal.ReadInt32(lParam); // KBDLLHOOKSTRUCT.vkCode
-            if (vk == Native.VK_LWIN || vk == Native.VK_RWIN)
+            var info = (Native.KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.KBDLLHOOKSTRUCT));
+            if (info.vkCode == Native.VK_LWIN || info.vkCode == Native.VK_RWIN)
             {
                 int msg = wParam.ToInt32();
+                bool own = info.dwExtraInfo == Native.OwnInputSignature;
+                DebugLog.Write(string.Format("key vk=0x{0:X} msg=0x{1:X} flags=0x{2:X} own={3} zoomed={4}",
+                    info.vkCode, msg, info.flags, own, zoomedDuringWin));
+
                 if (msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN)
                 {
+                    if (!winDown)
+                    {
+                        winDown = true;
+                        zoomedDuringWin = false;
+                    }
                     if (enabled) ShowOverlay();
                 }
                 else if (msg == Native.WM_KEYUP || msg == Native.WM_SYSKEYUP)
                 {
+                    winDown = false;
                     HideOverlay();
+                    if (!own && zoomedDuringWin)
+                    {
+                        zoomedDuringWin = false;
+                        ReleaseWinWithoutStartMenu((byte)info.vkCode);
+                        return new IntPtr(1); // 本来の解放は止め、ダミーキーを挟んだ解放を送り直す
+                    }
                 }
             }
         }
         return Native.CallNextHookEx(keyHookHandle, nCode, wParam, lParam);
+    }
+
+    // Win キー単独の押下・解放とみなされるとスタートメニューが開くため、
+    // 未割り当てのダミーキー (0xE8) を挟んでから Win キーを離し、「他のキーと組み合わせた」扱いにする
+    static void ReleaseWinWithoutStartMenu(byte winVk)
+    {
+        Native.keybd_event(Native.VK_DUMMY, 0, 0, Native.OwnInputSignature);
+        Native.keybd_event(Native.VK_DUMMY, 0, Native.KEYEVENTF_KEYUP, Native.OwnInputSignature);
+        Native.keybd_event(winVk, 0, Native.KEYEVENTF_KEYUP | Native.KEYEVENTF_EXTENDEDKEY, Native.OwnInputSignature);
     }
 
     void ShowOverlay()
@@ -168,21 +202,13 @@ sealed class ZoomContext : ApplicationContext
     void OnZoomWheel(int delta, Point cursor)
     {
         SetLevel((float)(level * Math.Pow(StepPerNotch, delta / 120.0)), cursor);
-        SuppressStartMenu();
+        zoomedDuringWin = true;
     }
 
     static bool IsWinKeyDown()
     {
         return (Native.GetAsyncKeyState(Native.VK_LWIN) & 0x8000) != 0
             || (Native.GetAsyncKeyState(Native.VK_RWIN) & 0x8000) != 0;
-    }
-
-    // Win キー単独の押下・解放とみなされるとスタートメニューが開くため、
-    // 未割り当てのダミーキー (0xE8) を挟んで「他のキーと組み合わせた」扱いにする
-    static void SuppressStartMenu()
-    {
-        Native.keybd_event(Native.VK_DUMMY, 0, 0, UIntPtr.Zero);
-        Native.keybd_event(Native.VK_DUMMY, 0, Native.KEYEVENTF_KEYUP, UIntPtr.Zero);
     }
 
     void SetLevel(float newLevel, Point cursor)
@@ -300,6 +326,22 @@ sealed class ZoomContext : ApplicationContext
     }
 }
 
+// 調査用: マウスホイールとタッチパッドのスクロールの違いを %TEMP%\ScreenZoom.log に記録する
+static class DebugLog
+{
+    static readonly string LogPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "ScreenZoom.log");
+
+    public static void Write(string line)
+    {
+        try
+        {
+            System.IO.File.AppendAllText(LogPath,
+                DateTime.Now.ToString("HH:mm:ss.fff") + " " + line + Environment.NewLine);
+        }
+        catch (System.IO.IOException) { }
+    }
+}
+
 // 仮想画面全体を覆うほぼ透明な最前面ウィンドウ。アクティブにならず、受け取ったホイールでズームする。
 sealed class OverlayForm : Form
 {
@@ -389,7 +431,10 @@ static class Native
     public const int VK_LWIN = 0x5B;
     public const int VK_RWIN = 0x5C;
     public const byte VK_DUMMY = 0xE8;
+    public const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
     public const uint KEYEVENTF_KEYUP = 0x0002;
+    // 自分で送ったキー入力をキーボードフックで見分けるための目印
+    public static readonly UIntPtr OwnInputSignature = new UIntPtr(0x5A4F4F4D);
     public const int SM_XVIRTUALSCREEN = 76;
     public const int SM_YVIRTUALSCREEN = 77;
     public const int SM_CXVIRTUALSCREEN = 78;
@@ -409,6 +454,19 @@ static class Native
         public uint time;
         public IntPtr dwExtraInfo;
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KBDLLHOOKSTRUCT
+    {
+        public int vkCode;
+        public uint scanCode;
+        public uint flags;
+        public uint time;
+        public UIntPtr dwExtraInfo;
+    }
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetMessageExtraInfo();
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern IntPtr SetWindowsHookEx(int idHook, LowLevelHookProc lpfn, IntPtr hMod, uint dwThreadId);
