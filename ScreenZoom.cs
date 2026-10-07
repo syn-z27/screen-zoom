@@ -42,8 +42,13 @@ sealed class ZoomContext : ApplicationContext
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     const string RunValue = "ScreenZoom";
 
-    readonly Native.LowLevelMouseProc hookProc; // GC 回収防止のためフィールドで保持
+    // GC 回収防止のためフックのデリゲートはフィールドで保持
+    readonly Native.LowLevelHookProc hookProc;
     readonly IntPtr hookHandle;
+    readonly Native.LowLevelHookProc keyHookProc;
+    readonly IntPtr keyHookHandle;
+    readonly OverlayForm overlay;
+    readonly System.Windows.Forms.Timer overlayWatch;
     readonly NotifyIcon tray;
     readonly ToolStripMenuItem enabledItem;
     readonly ToolStripMenuItem startupItem;
@@ -56,11 +61,20 @@ sealed class ZoomContext : ApplicationContext
         hookProc = HookCallback;
         hookHandle = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, hookProc,
             Native.GetModuleHandle(null), 0);
-        if (hookHandle == IntPtr.Zero)
+        keyHookProc = KeyHookCallback;
+        keyHookHandle = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, keyHookProc,
+            Native.GetModuleHandle(null), 0);
+        if (hookHandle == IntPtr.Zero || keyHookHandle == IntPtr.Zero)
         {
-            MessageBox.Show("マウスフックの登録に失敗しました。", "ScreenZoom",
+            MessageBox.Show("マウス/キーボードフックの登録に失敗しました。", "ScreenZoom",
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+
+        overlay = new OverlayForm(OnZoomWheel);
+        // Win+L 等でキーを離したことを取りこぼしても透明ウィンドウが残り続けないよう定期確認する
+        overlayWatch = new System.Windows.Forms.Timer();
+        overlayWatch.Interval = 200;
+        overlayWatch.Tick += delegate { if (!IsWinKeyDown()) HideOverlay(); };
 
         enabledItem = new ToolStripMenuItem("有効", null, delegate { ToggleEnabled(); });
         enabledItem.Checked = true;
@@ -99,9 +113,7 @@ sealed class ZoomContext : ApplicationContext
                 {
                     if (enabled && IsWinKeyDown())
                     {
-                        short delta = (short)((info.mouseData >> 16) & 0xFFFF);
-                        SetLevel((float)(level * Math.Pow(StepPerNotch, delta / 120.0)), pt);
-                        SuppressStartMenu();
+                        OnZoomWheel((short)((info.mouseData >> 16) & 0xFFFF), pt);
                         return new IntPtr(1); // ホイール入力自体はアプリに渡さない
                     }
                 }
@@ -112,6 +124,49 @@ sealed class ZoomContext : ApplicationContext
             }
         }
         return Native.CallNextHookEx(hookHandle, nCode, wParam, lParam);
+    }
+
+    // 高精度タッチパッドの二本指スクロールは Chrome やエクスプローラー等へ直接届き、
+    // マウスフックでは捕捉できない。Win キーを押している間だけ透明ウィンドウを最前面に置き、
+    // スクロールをそのウィンドウで受け取ることでアプリへ届かないようにする。
+    IntPtr KeyHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0)
+        {
+            int vk = Marshal.ReadInt32(lParam); // KBDLLHOOKSTRUCT.vkCode
+            if (vk == Native.VK_LWIN || vk == Native.VK_RWIN)
+            {
+                int msg = wParam.ToInt32();
+                if (msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN)
+                {
+                    if (enabled) ShowOverlay();
+                }
+                else if (msg == Native.WM_KEYUP || msg == Native.WM_SYSKEYUP)
+                {
+                    HideOverlay();
+                }
+            }
+        }
+        return Native.CallNextHookEx(keyHookHandle, nCode, wParam, lParam);
+    }
+
+    void ShowOverlay()
+    {
+        if (overlay.IsShown) return;
+        overlay.ShowOverlay();
+        overlayWatch.Start();
+    }
+
+    void HideOverlay()
+    {
+        overlayWatch.Stop();
+        overlay.HideOverlay();
+    }
+
+    void OnZoomWheel(int delta, Point cursor)
+    {
+        SetLevel((float)(level * Math.Pow(StepPerNotch, delta / 120.0)), cursor);
+        SuppressStartMenu();
     }
 
     static bool IsWinKeyDown()
@@ -167,7 +222,11 @@ sealed class ZoomContext : ApplicationContext
     {
         enabled = !enabled;
         enabledItem.Checked = enabled;
-        if (!enabled) SetLevel(1f, Cursor.Position);
+        if (!enabled)
+        {
+            HideOverlay();
+            SetLevel(1f, Cursor.Position);
+        }
         UpdateTooltip();
     }
 
@@ -223,6 +282,9 @@ sealed class ZoomContext : ApplicationContext
         if (cleanedUp) return;
         cleanedUp = true;
         if (hookHandle != IntPtr.Zero) Native.UnhookWindowsHookEx(hookHandle);
+        if (keyHookHandle != IntPtr.Zero) Native.UnhookWindowsHookEx(keyHookHandle);
+        overlayWatch.Stop();
+        overlay.Dispose();
         Native.MagSetFullscreenTransform(1f, 0, 0);
         Native.MagUninitialize();
         tray.Visible = false;
@@ -236,9 +298,90 @@ sealed class ZoomContext : ApplicationContext
     }
 }
 
+// 仮想画面全体を覆うほぼ透明な最前面ウィンドウ。アクティブにならず、受け取ったホイールでズームする。
+sealed class OverlayForm : Form
+{
+    const int WS_EX_TOPMOST = 0x00000008;
+    const int WS_EX_TOOLWINDOW = 0x00000080;
+    const int WS_EX_NOACTIVATE = 0x08000000;
+    const int WM_MOUSEACTIVATE = 0x0021;
+    const int MA_NOACTIVATE = 3;
+
+    readonly Action<int, Point> onWheel;
+
+    public bool IsShown { get; private set; }
+
+    public OverlayForm(Action<int, Point> onWheel)
+    {
+        this.onWheel = onWheel;
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        StartPosition = FormStartPosition.Manual;
+        BackColor = Color.Black;
+        Opacity = 0.01; // 完全透明 (0) だとマウス入力が素通りするため、見えない程度の値にする
+        CreateHandle();
+    }
+
+    protected override bool ShowWithoutActivation { get { return true; } }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ExStyle |= WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+            return cp;
+        }
+    }
+
+    public void ShowOverlay()
+    {
+        IsShown = true;
+        // WinForms の DPI 補正を避けるため、位置とサイズは物理ピクセルで直接指定する
+        Native.SetWindowPos(Handle, Native.HWND_TOPMOST,
+            Native.GetSystemMetrics(Native.SM_XVIRTUALSCREEN),
+            Native.GetSystemMetrics(Native.SM_YVIRTUALSCREEN),
+            Native.GetSystemMetrics(Native.SM_CXVIRTUALSCREEN),
+            Native.GetSystemMetrics(Native.SM_CYVIRTUALSCREEN),
+            Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW);
+    }
+
+    public void HideOverlay()
+    {
+        if (!IsShown) return;
+        IsShown = false;
+        Native.ShowWindow(Handle, Native.SW_HIDE);
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == Native.WM_MOUSEWHEEL)
+        {
+            onWheel((short)((m.WParam.ToInt64() >> 16) & 0xFFFF), Cursor.Position);
+            m.Result = IntPtr.Zero;
+            return;
+        }
+        if (m.Msg == WM_MOUSEACTIVATE)
+        {
+            m.Result = new IntPtr(MA_NOACTIVATE);
+            return;
+        }
+        base.WndProc(ref m);
+    }
+}
+
 static class Native
 {
+    public const int WH_KEYBOARD_LL = 13;
     public const int WH_MOUSE_LL = 14;
+    public const int WM_KEYDOWN = 0x0100;
+    public const int WM_KEYUP = 0x0101;
+    public const int WM_SYSKEYDOWN = 0x0104;
+    public const int WM_SYSKEYUP = 0x0105;
+    public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    public const uint SWP_NOACTIVATE = 0x0010;
+    public const uint SWP_SHOWWINDOW = 0x0040;
+    public const int SW_HIDE = 0;
     public const int WM_MOUSEMOVE = 0x0200;
     public const int WM_MOUSEWHEEL = 0x020A;
     public const int VK_LWIN = 0x5B;
@@ -250,7 +393,7 @@ static class Native
     public const int SM_CXVIRTUALSCREEN = 78;
     public const int SM_CYVIRTUALSCREEN = 79;
 
-    public delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+    public delegate IntPtr LowLevelHookProc(int nCode, IntPtr wParam, IntPtr lParam);
 
     [StructLayout(LayoutKind.Sequential)]
     public struct POINT { public int x; public int y; }
@@ -266,7 +409,13 @@ static class Native
     }
 
     [DllImport("user32.dll", SetLastError = true)]
-    public static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
+    public static extern IntPtr SetWindowsHookEx(int idHook, LowLevelHookProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool UnhookWindowsHookEx(IntPtr hhk);
