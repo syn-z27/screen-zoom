@@ -2,6 +2,10 @@
 // Ctrl+Shift を押しながらホイールを回すと画面全体を拡大/縮小し、拡大中はカーソルに追従する。
 // 管理者権限のウィンドウ (タスクマネージャー等) 上でも入力を捕捉できるよう、管理者権限で動かす (ScreenZoom.manifest)。
 // .NET Framework 4.x 付属の csc.exe (C# 5) でビルドできるよう、新しい言語機能は使わない。
+//
+// 管理者権限で動くため、exe と同じフォルダに置かれたファイルを読み込んだり、
+// 一般ユーザーが書き換えられる場所の exe を自動起動 (最上位の特権) に登録したりしないこと。
+// 自動起動は install.bat で Program Files にインストールした exe からのみ登録できる。
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -14,7 +18,11 @@ using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
+using System.Xml;
 using Microsoft.Win32;
+
+// DllImport の DLL は System32 からのみ読み込む (exe と同じフォルダに置かれた偽の DLL を読み込まない)
+[assembly: DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
 
 static class Program
 {
@@ -24,7 +32,8 @@ static class Program
         bool createdNew;
         using (var mutex = new Mutex(true, "ScreenZoom_SingleInstance", out createdNew))
         {
-            if (!createdNew) return;
+            // ミューテックスは他のプログラムからも作れるため、実際に ScreenZoom が動いているときだけ二重起動とみなす
+            if (!createdNew && Process.GetProcessesByName("ScreenZoom").Length > 1) return;
 
             // カーソル座標と画面サイズを物理ピクセルで扱うため Per-Monitor V2 を宣言
             try { Native.SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch (EntryPointNotFoundException) { }
@@ -130,7 +139,7 @@ sealed class ZoomContext : ApplicationContext
         SystemEvents.SessionEnding += delegate { Cleanup(); };
 
         // schtasks の実行は時間がかかるため、フックの応答を妨げないよう別スレッドで行う
-        RunStartupTaskInBackground(delegate { MigrateLegacyStartup(); });
+        RunStartupTaskInBackground(ReconcileStartup);
 
         // 時間のかかる準備がすべて終わってからフックを登録する
         InstallHooks();
@@ -180,18 +189,21 @@ sealed class ZoomContext : ApplicationContext
         if (keyboardDead || mouseDead) InstallHooks();
     }
 
-    // 処理を別スレッドで実行し、終わったら自動起動の登録状況をメニューに反映する
-    void RunStartupTaskInBackground(Action work)
+    // 処理を別スレッドで実行し、終わったら自動起動の登録状況をメニューに反映する。
+    // work が返したメッセージがあれば、トレイの通知で知らせる。
+    void RunStartupTaskInBackground(Func<string> work)
     {
         startupItem.Enabled = false;
         ThreadPool.QueueUserWorkItem(delegate
         {
-            work();
-            bool registered = IsStartupRegistered();
+            string notice = work();
+            bool registered = QueryStartupTaskCommand() != null;
             overlay.BeginInvoke((Action)delegate
             {
                 startupItem.Checked = registered;
-                startupItem.Enabled = true;
+                startupItem.Enabled = InstalledSecurely;
+                if (!InstalledSecurely) startupItem.Text = "Windows 起動時に実行（install.bat でのインストールが必要）";
+                if (notice != null) tray.ShowBalloonTip(10000, "ScreenZoom", notice, ToolTipIcon.Warning);
             });
         });
     }
@@ -331,6 +343,7 @@ sealed class ZoomContext : ApplicationContext
         try
         {
             if (Native.GetRawInputData(hRawInput, Native.RID_INPUT, buffer, ref size, headerSize) != size) return;
+            if (size < headerSize + 8) return; // 以降で読む RAWMOUSE の先頭 8 バイトが含まれていない
             var header = (Native.RAWINPUTHEADER)Marshal.PtrToStructure(buffer, typeof(Native.RAWINPUTHEADER));
             if (header.dwType != Native.RIM_TYPEMOUSE) return;
 
@@ -488,36 +501,103 @@ sealed class ZoomContext : ApplicationContext
             : "ScreenZoom - 無効";
     }
 
-    static bool IsStartupRegistered()
+    // 自動起動のタスクは管理者権限で exe を起動するため、一般ユーザーが exe を置き換えられる場所の exe を
+    // 登録すると、置き換えた exe が UAC の確認なしに管理者権限で動いてしまう。
+    // そのため管理者しか書き込めない Program Files 配下の exe だけを登録対象にする。
+    static readonly bool InstalledSecurely = IsSecureLocation(Application.ExecutablePath);
+
+    static bool IsSecureLocation(string exePath)
     {
-        return RunSchtasks("/Query /TN \"" + TaskName + "\"") == 0;
+        string root = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles).TrimEnd('\\') + "\\";
+        try
+        {
+            return Path.GetFullPath(exePath).StartsWith(root, StringComparison.OrdinalIgnoreCase);
+        }
+        catch (ArgumentException) { return false; }
+        catch (NotSupportedException) { return false; }
+        catch (PathTooLongException) { return false; }
     }
 
     void ToggleStartup()
     {
+        if (!InstalledSecurely) return;
         bool register = !startupItem.Checked;
         RunStartupTaskInBackground(delegate
         {
             if (register) RegisterStartupTask();
-            else RunSchtasks("/Delete /TN \"" + TaskName + "\" /F");
+            else DeleteStartupTask();
+            return null;
         });
     }
 
-    // 以前の版が Run キーに登録した自動起動は管理者権限では機能しないため、タスクスケジューラへ移す
-    static void MigrateLegacyStartup()
+    // 起動時に自動起動の登録を安全な状態にそろえる
+    static string ReconcileStartup()
     {
+        string notice = null;
+
+        // 以前の版が Run キーに登録した自動起動は管理者権限では機能しないため、タスクスケジューラへ移す
+        bool hadLegacy = false;
         using (var key = Registry.CurrentUser.OpenSubKey(LegacyRunKey, true))
         {
-            if (key == null || key.GetValue(LegacyRunValue) == null) return;
-            key.DeleteValue(LegacyRunValue, false);
+            if (key != null && key.GetValue(LegacyRunValue) != null)
+            {
+                key.DeleteValue(LegacyRunValue, false);
+                hadLegacy = true;
+            }
         }
-        RegisterStartupTask();
+
+        string command = QueryStartupTaskCommand();
+        if (command != null && !IsSecureLocation(command))
+        {
+            DeleteStartupTask();
+            command = null;
+            notice = "一般ユーザーが書き換えられる場所の exe を指していたため、自動起動を解除しました。" +
+                     "install.bat でインストールしてから、改めて自動起動を有効にしてください。";
+        }
+        else if (command != null && InstalledSecurely &&
+                 !string.Equals(Path.GetFullPath(command), Path.GetFullPath(Application.ExecutablePath), StringComparison.OrdinalIgnoreCase))
+        {
+            RegisterStartupTask(); // インストール先が変わった場合は今の exe を指すように登録し直す
+        }
+
+        if (hadLegacy && command == null)
+        {
+            if (InstalledSecurely) RegisterStartupTask();
+            else notice = "以前の自動起動の設定を解除しました。install.bat でインストールしてから、改めて自動起動を有効にしてください。";
+        }
+        return notice;
+    }
+
+    // 登録済みのタスクが起動する exe のパスを返す。未登録なら null
+    static string QueryStartupTaskCommand()
+    {
+        string output;
+        if (RunSchtasks("/Query /TN \"" + TaskName + "\" /XML", out output) != 0) return null;
+        try
+        {
+            var doc = new XmlDocument();
+            doc.LoadXml(output);
+            XmlNodeList commands = doc.GetElementsByTagName("Command");
+            return commands.Count > 0 ? commands[0].InnerText.Trim().Trim('"') : "";
+        }
+        catch (XmlException)
+        {
+            return ""; // 読めないタスクは安全でないものとして扱い、解除させる
+        }
+    }
+
+    static void DeleteStartupTask()
+    {
+        string output;
+        RunSchtasks("/Delete /TN \"" + TaskName + "\" /F", out output);
     }
 
     // ログオン時に「最上位の特権」で起動するタスクを登録する (UAC の確認なしで管理者権限になる)。
     // ノートPCでバッテリー駆動中も起動・継続するよう、電源条件を外すため XML で定義する。
     static void RegisterStartupTask()
     {
+        if (!InstalledSecurely) return;
+
         string user = SecurityElement.Escape(WindowsIdentity.GetCurrent().Name);
         string xml =
             "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n" +
@@ -533,11 +613,14 @@ sealed class ZoomContext : ApplicationContext
             "</Command></Exec></Actions>\n" +
             "</Task>\n";
 
-        string path = Path.GetTempFileName();
+        // ユーザーの TEMP に書くと schtasks が読み込むまでの間に書き換えられるおそれがあるため、
+        // 管理者しか書き込めないインストール先に書き出す
+        string path = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "ScreenZoom.task.xml");
         try
         {
             File.WriteAllText(path, xml, Encoding.Unicode);
-            if (RunSchtasks("/Create /TN \"" + TaskName + "\" /XML \"" + path + "\" /F") != 0)
+            string output;
+            if (RunSchtasks("/Create /TN \"" + TaskName + "\" /XML \"" + path + "\" /F", out output) != 0)
             {
                 MessageBox.Show("タスクスケジューラへの登録に失敗しました。", "ScreenZoom",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -549,17 +632,19 @@ sealed class ZoomContext : ApplicationContext
         }
     }
 
-    static int RunSchtasks(string arguments)
+    static int RunSchtasks(string arguments, out string output)
     {
-        var psi = new ProcessStartInfo("schtasks.exe", arguments);
+        // exe と同じフォルダの偽物を起動しないよう、System32 のフルパスで起動する
+        var psi = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "schtasks.exe"), arguments);
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
         psi.RedirectStandardOutput = true;
         psi.RedirectStandardError = true;
         using (var process = Process.Start(psi))
         {
-            process.StandardOutput.ReadToEnd();
-            process.StandardError.ReadToEnd();
+            var error = process.StandardError.ReadToEndAsync();
+            output = process.StandardOutput.ReadToEnd();
+            error.Wait();
             process.WaitForExit();
             return process.ExitCode;
         }
