@@ -9,11 +9,19 @@ rem Magnification API does not support WOW64, so build as x64 with the 64-bit co
 set "CSC=%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 set "DEST=%ProgramFiles%\ScreenZoom"
 
+rem Remove an exe left by the old build.bat, if any. Do this before elevating (normally as the user),
+rem and only for a regular file: a junction named ScreenZoom.exe would otherwise make del remove
+rem files in the folder it points to.
+if exist "%~dp0ScreenZoom.exe" if not exist "%~dp0ScreenZoom.exe\" del "%~dp0ScreenZoom.exe"
+
 "%SYS%\net.exe" session >nul 2>&1
 if errorlevel 1 (
   "%SYS%\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
   exit /b
 )
+
+rem csc looks for referenced assemblies in the current folder first, so build from System32.
+cd /d "%SYS%"
 
 if not exist "%DEST%" mkdir "%DEST%"
 
@@ -37,9 +45,6 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-
-rem Remove an exe left by the old build.bat, if any.
-if exist "%~dp0ScreenZoom.exe" del "%~dp0ScreenZoom.exe"
 
 start "" "%DEST%\ScreenZoom.exe"
 echo Installed to "%DEST%".
