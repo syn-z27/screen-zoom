@@ -544,7 +544,7 @@ sealed class ZoomContext : ApplicationContext
     }
 
     // 拡大中は、カーソルを拡大しているディスプレイの外へ出さない。
-    // 閉じ込めは他のアプリや Windows（Ctrl+Alt+Del、画面のロック等）に解除されることがあるため、
+    // 閉じ込めは他のアプリや Windows (Ctrl+Alt+Del、画面のロック等) に解除されることがあるため、
     // 画面の拡大を更新するたびに確かめて、解除されていれば閉じ込め直す
     void ConfineCursor()
     {
@@ -985,7 +985,7 @@ sealed class MagnifierWindow : NativeWindow, IDisposable
         var cp = new CreateParams();
         cp.Caption = "ScreenZoom";
         cp.Style = WS_POPUP;
-        // レイヤードウィンドウ (WS_EX_LAYERED) に WS_EX_TRANSPARENT を付けると、クリップやホイールが下へ素通りする
+        // レイヤードウィンドウ (WS_EX_LAYERED) に WS_EX_TRANSPARENT を付けると、クリックやホイールが下へ素通りする
         cp.ExStyle = WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE;
         CreateHandle(cp);
         Native.SetLayeredWindowAttributes(Handle, 0, 255, LWA_ALPHA);
@@ -995,7 +995,7 @@ sealed class MagnifierWindow : NativeWindow, IDisposable
         control = Native.CreateWindowEx(0, "Magnifier", "ScreenZoomMagnifier",
             WS_CHILD | WS_VISIBLE, 0, 0, 0, 0,
             Handle, IntPtr.Zero, Native.GetModuleHandle(null), IntPtr.Zero);
-        
+
         refresh = new System.Windows.Forms.Timer();
         refresh.Interval = RefreshMs;
         refresh.Tick += delegate
@@ -1018,7 +1018,7 @@ sealed class MagnifierWindow : NativeWindow, IDisposable
     {
         // 拡大する領域は MagSetWindowSource では左上を整数でしか指定できず、丸めた分 (最大 level / 2 ピクセル)
         // ズームのたびに中身が揺れる。変換行列の平行移動 (画面座標の原点基準) は端数も反映されるため、
-        // こちらで位置を決める (ZoomIt のライブズームと同じ方法) 。
+        // こちらで位置を決める (ZoomIt のライブズームと同じ方法)。
         var transform = new Native.MAGTRANSFORM();
         transform.v = new float[9];
         transform.v[0] = level;
