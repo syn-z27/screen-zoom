@@ -1,5 +1,5 @@
 // ScreenZoom: macOS のアクセシビリティズームを Windows で再現する常駐ツール。
-// Shift+Alt を押しながらホイールを回すと画面全体を拡大/縮小し、拡大中はカーソルに追従する。
+// Shift+Alt を押しながらホイールを回すとカーソルのあるディスプレイだけを拡大/縮小し、拡大中はカーソルに追従する。
 // 管理者権限のウィンドウ (タスクマネージャー等) 上でも入力を捕捉できるよう、管理者権限で動かす (ScreenZoom.manifest)。
 // .NET Framework 4.x 付属の csc.exe (C# 5) でビルドできるよう、新しい言語機能は使わない。
 //
@@ -48,8 +48,21 @@ static class Program
                 return;
             }
 
+            // 前回強制終了されてカーソルが隠れたままになっていても戻す
+            Native.MagShowSystemCursor(true);
+
+            var magnifier = new MagnifierWindow();
+            if (!magnifier.IsAvailable)
+            {
+                MessageBox.Show("拡大鏡ウィンドウの作成に失敗しました。", "ScreenZoom",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                magnifier.Dispose();
+                Native.MagUninitialize();
+                return;
+            }
+
             Application.EnableVisualStyles();
-            Application.Run(new ZoomContext());
+            Application.Run(new ZoomContext(magnifier));
         }
     }
 
@@ -95,6 +108,9 @@ sealed class ZoomContext : ApplicationContext
     readonly Native.LowLevelHookProc keyHookProc;
     IntPtr keyHookHandle;
     readonly OverlayForm overlay;
+    readonly MagnifierWindow magnifier;
+    bool cursorHidden;        // 等倍のシステムカーソルを隠しているか
+    bool cursorConfined;      // カーソルをディスプレイの中に閉じ込めているか
     readonly System.Windows.Forms.Timer overlayWatch;
     readonly System.Windows.Forms.Timer sourceTimer;
     readonly System.Windows.Forms.Timer hookWatch;
@@ -115,16 +131,20 @@ sealed class ZoomContext : ApplicationContext
 
     float level = 1f;
     bool enabled = true;
+    // 拡大しているディスプレイ（等倍時の画面座標）。拡大を始めたときのカーソルの位置で決め、拡大中はカーソルをこの中に閉じ込める
+    Rectangle monitor;
     // 拡大表示している領域の左上 (等倍時の画面座標)。カーソルが領域の端を越えたときだけ動かす
     double viewX;
     double viewY;
 
-    public ZoomContext()
+    public ZoomContext(MagnifierWindow magnifier)
     {
         hookProc = HookCallback;
         keyHookProc = KeyHookCallback;
 
         overlay = new OverlayForm(OnOverlayWheel, OnRawInput);
+        this.magnifier = magnifier;
+        magnifier.Exclude(overlay.Handle); // ほぼ透明な黒いウィンドウが拡大結果に写りこまないようにする
         RegisterRawMouseInput();
         sourceTimer = new System.Windows.Forms.Timer();
         sourceTimer.Interval = 10;
@@ -250,6 +270,15 @@ sealed class ZoomContext : ApplicationContext
             {
                 var info = (Native.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.MSLLHOOKSTRUCT));
                 var pt = new Point(info.pt.x, info.pt.y);
+                if (level > 1f && !monitor.Contains(pt))
+                {
+                    // ClipCursor で閉じ込めていても、フックには境界で止められる前の（外側の）位置が届く。
+                    // 実際のカーソルと同じく境界に収めて扱い、閉じ込めが解除されていないかだけ確かめる
+                    pt = new Point(
+                        Math.Max(monitor.Left, Math.Min(pt.X, monitor.Right - 1)),
+                        Math.Max(monitor.Top, Math.Min(pt.Y, monitor.Bottom - 1)));
+                        RequestTransform();
+                }
                 lastHookCursor = pt;
                 lastMouseHookMs = clock.ElapsedMilliseconds;
 
@@ -440,11 +469,11 @@ sealed class ZoomContext : ApplicationContext
         if (newLevel > MaxLevel) newLevel = MaxLevel;
         if (newLevel == level) return;
 
-        Rectangle screen = VirtualScreen();
         if (level <= 1f)
         {
-            viewX = screen.Left;
-            viewY = screen.Top;
+            monitor = MonitorAt(cursor);
+            viewX = monitor.Left;
+            viewY = monitor.Top;
         }
         // カーソルが画面上の同じ位置に見えたままになるよう、カーソルを中心に拡大/縮小する
         viewX = cursor.X - (cursor.X - viewX) * level / newLevel;
@@ -457,9 +486,8 @@ sealed class ZoomContext : ApplicationContext
     // カーソルが拡大表示している領域の端を越えたときだけ、越えた分だけ領域を動かす
     void FollowCursor(Point cursor)
     {
-        Rectangle screen = VirtualScreen();
-        double viewWidth = screen.Width / level;
-        double viewHeight = screen.Height / level;
+        double viewWidth = monitor.Width / level;
+        double viewHeight = monitor.Height / level;
         double x = viewX;
         double y = viewY;
 
@@ -477,9 +505,8 @@ sealed class ZoomContext : ApplicationContext
 
     void ClampView()
     {
-        Rectangle screen = VirtualScreen();
-        viewX = Clamp(viewX, screen.Left, screen.Right - screen.Width / level);
-        viewY = Clamp(viewY, screen.Top, screen.Bottom - screen.Height / level);
+        viewX = Clamp(viewX, monitor.Left, monitor.Right - monitor.Width / level);
+        viewY = Clamp(viewY, monitor.Top, monitor.Bottom - monitor.Height / level);
     }
 
     // 画面の拡大の更新はフックの外で行う。予約中に届いた変更はまとめて最新の状態だけを反映する
@@ -495,19 +522,79 @@ sealed class ZoomContext : ApplicationContext
         });
     }
 
+    // 拡大中も実際のカーソルは拡大表示している領域の中にあり、拡大鏡ウィンドウが領域をカーソルごと
+    // ディスプレイ全体に拡大して描く。見えているカーソルの位置と実際にクリックされる位置が一致するよう、
+    // 拡大されていない本物のカーソルは隠す。
     void ApplyTransform()
     {
-        if (level <= 1f) Native.MagSetFullscreenTransform(1f, 0, 0);
-        else Native.MagSetFullscreenTransform(level, (int)Math.Round(viewX), (int)Math.Round(viewY));
+        // 順序は ZoomIt に合わせる: 拡大鏡にカーソルを描かせてから本物を隠し、
+        // 拡大鏡からカーソルを外してから本物を戻す
+        if (level <= 1f)
+        {
+            magnifier.HideView();
+            ShowSystemCursor(true);
+            ReleaseCursor();
+        }
+        else 
+        {
+            ConfineCursor();
+            magnifier.ShowView(monitor, level, viewX, viewY);
+            ShowSystemCursor(false);
+        }
     }
 
-    static Rectangle VirtualScreen()
+    // 拡大中は、カーソルを拡大しているディスプレイの外へ出さない。
+    // 閉じ込めはほかのアプリや Windows（Ctrl+Alt+Del、画面のロック等）に解除されることがあるため、
+    // 画面の拡大を更新するたびに確かめて、解除されていれば閉じ込め直す
+    void ConfineCursor()
     {
-        return new Rectangle(
-            Native.GetSystemMetrics(Native.SM_XVIRTUALSCREEN),
-            Native.GetSystemMetrics(Native.SM_YVIRTUALSCREEN),
-            Native.GetSystemMetrics(Native.SM_CXVIRTUALSCREEN),
-            Native.GetSystemMetrics(Native.SM_CYVIRTUALSCREEN));
+        Native.RECT current;
+        if (Native.GetClipCursor(out current) && SameRect(current, monitor)) return;
+        Native.RECT rect = ToRect(monitor);
+        Native.ClipCursor(ref rect);
+        cursorConfined = true;
+    }
+
+    void ReleaseCursor()
+    {
+        if (!cursorConfined) return;
+        cursorConfined = false;
+        // 他のアプリが後から設定した閉じ込めは解除しない
+        Native.RECT current;
+        if (Native.GetClipCursor(out current) && SameRect(current, monitor)) Native.ClipCursor(IntPtr.Zero);
+    }
+
+    static Native.RECT ToRect(Rectangle r)
+    {
+        var rect = new Native.RECT();
+        rect.left = r.Left;
+        rect.top = r.Top;
+        rect.right = r.Right;
+        rect.bottom = r.Bottom;
+        return rect;
+    }
+
+    static bool SameRect(Native.RECT a, Rectangle b)
+    {
+        return a.left == b.Left && a.top == b.Top && a.right == b.Right && a.bottom == b.Bottom;
+    }
+
+    void ShowSystemCursor(bool show)
+    {
+        if (cursorHidden != show) return;
+        cursorHidden = !show;
+        Native.MagShowSystemCursor(show);
+        if (!show)
+        {
+            // 隠した直後は拡大したカーソルが描かれないことがあるため、同じ位置へ動かして描き直させる（ZoomIt と同じ）
+            Point pos = Cursor.Position;
+            Native.SetCursorPos(pos.X, pos.Y);
+        }
+    }
+
+    static Rectangle MonitorAt(Point pt)
+    {
+        return Screen.FromPoint(pt).Bounds;
     }
 
     static double Clamp(double v, double min, double max)
@@ -772,7 +859,9 @@ sealed class ZoomContext : ApplicationContext
         overlayWatch.Stop();
         sourceTimer.Stop();
         overlay.Dispose();
-        Native.MagSetFullscreenTransform(1f, 0, 0);
+        magnifier.Dispose(); // 拡大鏡からカーソルを外してから、本物のカーソルを戻す
+        Native.MagShowSystemCursor(true);
+        ReleaseCursor();
         Native.MagUninitialize();
         tray.Visible = false;
         tray.Dispose();
@@ -865,6 +954,128 @@ sealed class OverlayForm : Form
     }
 }
 
+// 拡大するディスプレイだけを覆う最前面ウィンドウ。中の拡大鏡コントロールが、指定した領域を
+// カーソルごと拡大して描く。入力はすべて下のウィンドウへ素通りさせ、アクティブにもならない。
+sealed class MagnifierWindow : NativeWindow, IDisposable
+{
+    const int WS_POPUP = unchecked((int)0x80000000);
+    const int WS_CHILD = 0x40000000;
+    const int WS_VISIBLE = 0x10000000;
+    const int WS_EX_TOPMOST = 0x00000008;
+    const int WS_EX_TRANSPARENT = 0x00000020;
+    const int WS_EX_TOOLWINDOW = 0x00000080;
+    const int WS_EX_LAYERED = 0x00080000;
+    const int WS_EX_NOACTIVATE = 0x08000000;
+    const int MS_SHOWMAGNIFIEDCURSOR = 0x0001;
+    const uint LWA_ALPHA = 0x00000002;
+    const uint MW_FILTERMODE_EXCLUDE = 0;
+
+    // 拡大鏡コントロールは自動では描き直されないため、一定間隔で描き直させる
+    const int RefreshMs = 16;
+
+    readonly IntPtr control;
+    readonly System.Windows.Forms.Timer refresh;
+    Rectangle bounds;
+
+    public bool IsAvailable { get { return control != IntPtr.Zero; } }
+    public bool IsShown { get; private set; }
+
+    public MagnifierWindow()
+    {
+        var cp = new CreateParams();
+        cp.Caption = "ScreenZoom";
+        cp.Style = WS_POPUP;
+        // レイヤードウィンドウ（WS_EX_LAYERED）に WS_EX_TRANSPARENT を付けると、クリップやホイールが下へ素通りする
+        cp.ExStyle = WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE;
+        CreateHandle(cp);
+        Native.SetLayeredWindowAttributes(Handle, 0, 255, LWA_ALPHA);
+
+        // "Magnifier" ウィンドウクラスは MagInitialize で登録される。
+        // カーソルを描かせる MS_SHOWMAGNIFIEDCURSOR は、拡大している間だけ付ける（SetCursorMagnified）
+        control = Native.CreateWindowEx(0, "Magnifier", "ScreenZoomMagnifier",
+            WS_CHILD | WS_VISIBLE, 0, 0, 0, 0,
+            Handle, IntPtr.Zero, Native.GetModuleHandle(null), IntPtr.Zero);
+        
+        refresh = new System.Windows.Forms.Timer();
+        refresh.Interval = RefreshMs;
+        refresh.Tick += delegate
+        {
+            Native.InvalidateRect(control, IntPtr.Zero, false);
+            // 後から最前面に出たウィンドウ（メニュー等）が拡大されずに上に重ならないよう、最前面に戻し続ける
+            Native.SetWindowPos(Handle, Native.HWND_TOPMOST, 0, 0, 0, 0,
+                Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
+        };
+    }
+
+    // 指定したウィンドウを拡大結果に移さない
+    public void Exclude(IntPtr hwnd)
+    {
+        Native.MagSetWindowFilterList(control, MW_FILTERMODE_EXCLUDE, 1, new[] { hwnd });
+    }
+
+    // monitor 全体に、左上（x, y）から monitor の大きさ / level の領域を level 倍にして表示する
+    public void ShowView(Rectangle monitor, float level, double x, double y)
+    {
+        // 拡大する領域は MagSetWindowSource では左上を整数でしか指定できず、丸めた分（最大 level / 2 ピクセル）
+        // ズームのたびに中身が揺れる。変換行列の平行移動（画面座標の原点基準）は端数も反映されるため、
+        // こちらで位置を決める（ZoomIt のライブズームと同じ方法）。
+        var transform = new Native.MAGTRANSFORM();
+        transform.v = new float[9];
+        transform.v[0] = level;
+        transform.v[2] = (float)(-x * level);
+        transform.v[4] = level;
+        transform.v[5] = (float)(-y * level);
+        transform.v[8] = 1f;
+        Native.MagSetWindowTransform(control, ref transform);
+
+        // 前の内容が一瞬見えないよう、拡大する領域を設定してから表示・移動する
+        if (!IsShown || monitor != bounds)
+        {
+            bounds = monitor;
+            Native.SetWindowPos(control, IntPtr.Zero, 0, 0, monitor.Width, monitor.Height,
+                Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
+            // WinForms の DPI 補正を避けるため、位置とサイズは物理ピクセルで直接指定する
+            Native.SetWindowPos(Handle, Native.HWND_TOPMOST, monitor.X, monitor.Y, monitor.Width, monitor.Height,
+                Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW);
+        }
+        Native.InvalidateRect(control, IntPtr.Zero, false);
+
+        if (!IsShown)
+        {
+            IsShown = true;
+            SetCursorMagnified(true);
+            refresh.Start();
+        }
+    }
+
+    public void HideView()
+    {
+        if (!IsShown) return;
+        IsShown = false;
+        refresh.Stop();
+        // MS_SHOWMAGNIFIEDCURSOR を付けたままだと、隠した後も拡大鏡コントロールがカーソルを持ち続け、
+        // MagShowSystemCursor(true) で戻しても本物のカーソルが表示されなくなる（ZoomIt も同じ対処をしている）
+        SetCursorMagnified(false);
+        Native.ShowWindow(Handle, Native.SW_HIDE);
+    }
+
+    void SetCursorMagnified(bool magnified)
+    {
+        int style = Native.GetWindowLong(control, Native.GWL_STYLE);
+        style = magnified ? style | MS_SHOWMAGNIFIEDCURSOR : style & ~MS_SHOWMAGNIFIEDCURSOR;
+        Native.SetWindowLong(control, Native.GWL_STYLE, style);
+        Native.InvalidateRect(control, IntPtr.Zero, true);
+        Native.RedrawWindow(Handle, IntPtr.Zero, IntPtr.Zero, Native.RDW_ALLCHILDREN | Native.RDW_UPDATENOW);
+    }
+
+    public void Dispose()
+    {
+        HideView();
+        refresh.Dispose();
+        DestroyHandle(); // 子の拡大鏡コントロールも一緒に破棄される
+    }
+}
+
 static class Native
 {
     public const int WH_KEYBOARD_LL = 13;
@@ -874,6 +1085,9 @@ static class Native
     public const int WM_SYSKEYDOWN = 0x0104;
     public const int WM_SYSKEYUP = 0x0105;
     public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    public const uint SWP_NOSIZE = 0x0001;
+    public const uint SWP_NOMOVE = 0x0002;
+    public const uint SWP_NOZORDER = 0x0004;
     public const uint SWP_NOACTIVATE = 0x0010;
     public const uint SWP_SHOWWINDOW = 0x0040;
     public const int SW_HIDE = 0;
@@ -899,6 +1113,13 @@ static class Native
 
     [StructLayout(LayoutKind.Sequential)]
     public struct POINT { public int x; public int y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MAGTRANSFORM
+    {
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 9)]
+        public float[] v;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct MSLLHOOKSTRUCT
@@ -978,5 +1199,49 @@ static class Native
     public static extern bool MagUninitialize();
 
     [DllImport("Magnification.dll")]
-    public static extern bool MagSetFullscreenTransform(float magLevel, int xOffset, int yOffset);
+    public static extern bool MagSetWindowTransform(IntPtr hwnd, ref MAGTRANSFORM pTransform);
+
+    [DllImport("Magnification.dll")]
+    public static extern bool MagSetWindowFilterList(IntPtr hwnd, uint dwFilterMode, int count, IntPtr[] pHWND);
+
+    [DllImport("Magnification.dll")]
+    public static extern bool MagShowSystemCursor(bool fShowCursor);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr CreateWindowEx(int dwExStyle, string lpClassName, string lpWindowName, int dwStyle, 
+        int x, int y, int nWidth, int nHeight, IntPtr hWndParent, IntPtr hMenu, IntPtr hInstance, IntPtr lpParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint crKey, byte bAlpha, uint dwFlags);
+
+    [DllImport("user32.dll")]
+    public static extern bool InvalidateRect(IntPtr hWnd, IntPtr lpRect, bool bErase);
+
+    public const int GWL_STYLE = -16;
+    public const uint RDW_UPDATENOW = 0x0100;
+    public const uint RDW_ALLCHILDREN = 0x0080;
+    
+    [DllImport("user32.dll")]
+    public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll")]
+    public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+
+    [DllImport("user32.dll")]
+    public static extern bool RedrawWindow(IntPtr hWnd, IntPtr lprcUpdate, IntPtr hrgnUpdate, uint flags);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetCursorPos(int x, int y);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int left; public int top; public int right; public int bottom; }
+
+    [DllImport("user32.dll")]
+    public static extern bool ClipCursor(ref RECT lpRect);
+
+    [DllImport("user32.dll")]
+    public static extern bool ClipCursor(IntPtr lpRect); // IntPtr.Zero で解除
+
+    [DllImport("user32.dll")]
+    public static extern bool GetClipCursor(out RECT lpRect);
 }
